@@ -141,9 +141,9 @@ jobs:
       - name: Build
         run: |
           go build -trimpath -o dist/${ASSET_NAME} \
-            -ldflags "-X 'github.com/nxtrace/NTrace-core/config.Version=${BUILD_VERSION}' \
-                      -X 'github.com/nxtrace/NTrace-core/config.BuildDate=${BUILD_DATE}' \
-                      -X 'github.com/nxtrace/NTrace-core/config.CommitID=${COMMIT_SHA1}'\
+            -ldflags "-X 'github.com/gdyan2022/NTrace-core/config.Version=${BUILD_VERSION}' \
+                      -X 'github.com/gdyan2022/NTrace-core/config.BuildDate=${BUILD_DATE}' \
+                      -X 'github.com/gdyan2022/NTrace-core/config.CommitID=${COMMIT_SHA1}'\
                       -w -s"
       - name: Upload files to Artifacts
         uses: actions/upload-artifact@v4
@@ -176,7 +176,7 @@ jobs:
           git config --global user.name "${{ secrets.git_name }}"
       - name: Clone repo
         run: |
-          git clone https://github.com/nxtrace/homebrew-nexttrace.git
+          git clone https://github.com/gdyan2022/homebrew-nexttrace.git
       - name: Exec scipt
         run: |
           cd homebrew-nexttrace
@@ -193,7 +193,7 @@ jobs:
         run: |
           cd homebrew-nexttrace
           git commit -am 'Publish a new version with Formula' || true
-          git remote set-url origin https://${{ secrets.gt_token }}@github.com/nxtrace/homebrew-nexttrace.git
+          git remote set-url origin https://${{ secrets.gt_token }}@github.com/gdyan2022/homebrew-nexttrace.git
           git push
         # env:
         #   SSH_AUTH_SOCK: /tmp/ssh_agent.sock
