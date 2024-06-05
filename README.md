@@ -237,6 +237,9 @@ nexttrace --no-rdns www.bbix.net
 # Set the payload size to 1024 bytes
 nexttrace --psize 1024 example.com
 
+# Set the payload size and DF flag for TCP Trace
+nexttrace --psize 1024 --dont-fragment --tcp example.com
+
 # Feature: print Route-Path diagram
 # Route-Path diagram example:
 # AS6453 Tata Communication「Singapore『Singapore』」
@@ -289,7 +292,7 @@ nexttrace -T -q 2 --parallel-requests 1 -t -P 2001:4860:4860::8888
 
 ### IP Database
 
-#### We use [bgp.tools](https://bgp.tools) as a data provider for routing tables.
+We use [bgp.tools](https://bgp.tools) as a data provider for routing tables.
 
 NextTrace BackEnd is now open-source.
 
@@ -329,16 +332,10 @@ Arguments:
   -T  --tcp                          Use TCP SYN for tracerouting (default port
                                      is 80)
   -U  --udp                          Use UDP SYN for tracerouting (default port
-                                     is 53)
+                                     is 33494)
   -F  --fast-trace                   One-Key Fast Trace to China ISPs
-  -p  --port                         Set the destination port to use. It is
-                                     either initial udp port value for
-                                     "default"method (incremented by each
-                                     probe, default is 33434), or initial seq
-                                     for "icmp" (incremented as well, default
-                                     from 1), or some constantdestination port
-                                     for other methods (with default of 80 for
-                                     "tcp", 53 for "udp", etc.)
+  -p  --port                         Set the destination port to use. With
+                                     default of 80 for "tcp", 33494 for "udp"
   -q  --queries                      Set the number of probes per each hop.
                                      Default: 3
       --parallel-requests            Set ParallelRequests number. It should be
@@ -350,9 +347,9 @@ Arguments:
                                      IPInfo, IPInsight, IP-API.com, Ip2region,
                                      IPInfoLocal, CHUNZHEN, disable-geoip].
                                      Default: LeoMoeAPI
-      --pow-provider                 Choose PoW Provider [api.nxtrace.org, sakura]
-                                     For China mainland users, please use
-                                     sakura. Default: api.nxtrace.org
+      --pow-provider                 Choose PoW Provider [api.nxtrace.org,
+                                     sakura] For China mainland users, please
+                                     use sakura. Default: api.nxtrace.org
   -n  --no-rdns                      Do not resolve IP addresses to their
                                      domain names
   -a  --always-rdns                  Always resolve IP addresses to their
@@ -379,16 +376,15 @@ Arguments:
   -z  --send-time                    Set how many [milliseconds] between
                                      sending each packet.. Useful when some
                                      routers use rate-limit for ICMP messages.
-                                     Default: 100
+                                     Default: 50
   -i  --ttl-time                     Set how many [milliseconds] between
                                      sending packets groups by TTL. Useful when
                                      some routers use rate-limit for ICMP
-                                     messages. Default: 500
+                                     messages. Default: 50
       --timeout                      The number of [milliseconds] to keep probe
                                      sockets open before giving up on the
                                      connection.. Default: 1000
-      --psize                        Set the packet size (payload size).
-                                     Default: 52
+      --psize                        Set the payload size. Default: 52
       --_positionalArg_nexttrace_32  IP Address or domain name
       --dot-server                   Use DoT Server for DNS Parse [dnssb,
                                      aliyun, dnspod, google, cloudflare]
@@ -396,6 +392,8 @@ Arguments:
                                      cn]. Default: cn
       --file                         Read IP Address or domain name from file
   -C  --nocolor                      Disable Colorful Output
+      --dont-fragment                Set the Don't Fragment bit (IPv4 TCP
+                                     only). Default: false
 ```
 
 ## Project screenshot
@@ -420,9 +418,11 @@ This software is still in the early stages of development and may have many flaw
 
 ## NextTraceroute
 
-`NextTraceroute` is a root-free Android route tracing application that defaults to using the `NextTrace API`, developed by @surfaceocean.
+`NextTraceroute` is a root-free Android route tracing application that defaults to using the `NextTrace API`, developed by @surfaceocean.  
+Thank you to all the test users for your enthusiastic support. This app has successfully passed the closed testing phase and is now officially available on the Google Play Store.
 
-[https://github.com/nxtrace/NextTraceroute](https://github.com/nxtrace/NextTraceroute)
+[https://github.com/nxtrace/NextTraceroute](https://github.com/nxtrace/NextTraceroute)  
+<a href='https://play.google.com/store/apps/details?id=com.surfaceocean.nexttraceroute&pcampaignid=pcampaignidMKT-Other-global-all-co-prtnr-py-PartBadge-Mar2515-1'><img alt='Get it on Google Play' width="128" height="48" src='https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png'/></a>
 
 ## LeoMoeAPI Credits
 
@@ -443,11 +443,13 @@ We hope you can give us as much feedback as possible on IP geolocation errors (s
 
 ## JetBrain Support
 
-#### This Project uses [JetBrain Open-Source Project License](https://jb.gg/OpenSourceSupport). We Proudly Develop By Goland.
+This Project uses [JetBrain Open-Source Project License](https://jb.gg/OpenSourceSupport). We Proudly Develop By `Goland`.
 
 <img src="https://resources.jetbrains.com/storage/products/company/brand/logos/GoLand.png" title="" alt="GoLand logo" width="331">
 
 ## Credits
+
+[Gubo](https://www.gubo.org) Reliable Host Recommendation Website
 
 [IPInfo](https://ipinfo.io) Provided most of the data support for this project free of charge
 

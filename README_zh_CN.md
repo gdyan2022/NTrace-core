@@ -229,7 +229,7 @@ nexttrace --tcp --port 443 2001:4860:4860::8888
 # UDP Trace
 nexttrace --udp 1.0.0.1
 
-# 可以自行指定端口[此处为5353]，默认53端口
+# 可以自行指定端口[此处为5353]，默认33494端口
 nexttrace --udp --port 5353 1.0.0.1
 ```
 
@@ -252,6 +252,9 @@ nexttrace --no-rdns www.bbix.net
 
 # 设置载荷大小为1024字节
 nexttrace --psize 1024 example.com
+
+# 设置载荷大小以及DF标志进行TCP Trace
+nexttrace --psize 1024 --dont-fragment --tcp example.com
 
 # 特色功能：打印Route-Path图
 # Route-Path图示例：
@@ -328,16 +331,10 @@ Arguments:
   -T  --tcp                          Use TCP SYN for tracerouting (default port
                                      is 80)
   -U  --udp                          Use UDP SYN for tracerouting (default port
-                                     is 53)
+                                     is 33494)
   -F  --fast-trace                   One-Key Fast Trace to China ISPs
-  -p  --port                         Set the destination port to use. It is
-                                     either initial udp port value for
-                                     "default"method (incremented by each
-                                     probe, default is 33434), or initial seq
-                                     for "icmp" (incremented as well, default
-                                     from 1), or some constantdestination port
-                                     for other methods (with default of 80 for
-                                     "tcp", 53 for "udp", etc.)
+  -p  --port                         Set the destination port to use. With
+                                     default of 80 for "tcp", 33494 for "udp"
   -q  --queries                      Set the number of probes per each hop.
                                      Default: 3
       --parallel-requests            Set ParallelRequests number. It should be
@@ -349,9 +346,9 @@ Arguments:
                                      IPInfo, IPInsight, IP-API.com, Ip2region,
                                      IPInfoLocal, CHUNZHEN, disable-geoip].
                                      Default: LeoMoeAPI
-      --pow-provider                 Choose PoW Provider [api.nxtrace.org, sakura]
-                                     For China mainland users, please use
-                                     sakura. Default: api.nxtrace.org
+      --pow-provider                 Choose PoW Provider [api.nxtrace.org,
+                                     sakura] For China mainland users, please
+                                     use sakura. Default: api.nxtrace.org
   -n  --no-rdns                      Do not resolve IP addresses to their
                                      domain names
   -a  --always-rdns                  Always resolve IP addresses to their
@@ -378,16 +375,15 @@ Arguments:
   -z  --send-time                    Set how many [milliseconds] between
                                      sending each packet.. Useful when some
                                      routers use rate-limit for ICMP messages.
-                                     Default: 100
+                                     Default: 50
   -i  --ttl-time                     Set how many [milliseconds] between
                                      sending packets groups by TTL. Useful when
                                      some routers use rate-limit for ICMP
-                                     messages. Default: 500
+                                     messages. Default: 50
       --timeout                      The number of [milliseconds] to keep probe
                                      sockets open before giving up on the
                                      connection.. Default: 1000
-      --psize                        Set the packet size (payload size).
-                                     Default: 52
+      --psize                        Set the payload size. Default: 52
       --_positionalArg_nexttrace_32  IP Address or domain name
       --dot-server                   Use DoT Server for DNS Parse [dnssb,
                                      aliyun, dnspod, google, cloudflare]
@@ -395,6 +391,8 @@ Arguments:
                                      cn]. Default: cn
       --file                         Read IP Address or domain name from file
   -C  --nocolor                      Disable Colorful Output
+      --dont-fragment                Set the Don't Fragment bit (IPv4 TCP
+                                     only). Default: false
 ```
 
 ## 项目截图
@@ -428,8 +426,7 @@ nexttrace --pow-provider sakura
 
 ## OpenTrace
 
-`OpenTrace`是 @Archeb 开发的`NextTrace`的跨平台`GUI`版本，带来您熟悉但更强大的用户体验。
-
+`OpenTrace`是 @Archeb 开发的`NextTrace`的跨平台`GUI`版本，带来您熟悉但更强大的用户体验。  
 该软件仍然处于早期开发阶段，可能存在许多缺陷和错误，需要您宝贵的使用反馈。
 
 [https://github.com/Archeb/opentrace](https://github.com/Archeb/opentrace)
@@ -442,11 +439,21 @@ nexttrace --pow-provider sakura
 
 ## NextTraceroute
 
-`NextTraceroute`，一款默认使用`NextTrace API`的免`root`安卓版路由跟踪应用，由 @surfaceocean 开发。
+`NextTraceroute`，一款默认使用`NextTrace API`的免`root`安卓版路由跟踪应用，由 @surfaceocean 开发。  
+感谢所有测试用户的热情支持，本应用已经通过封闭测试，正式进入 Google Play 商店。
 
-[https://github.com/nxtrace/NextTraceroute](https://github.com/nxtrace/NextTraceroute)
+[https://github.com/nxtrace/NextTraceroute](https://github.com/nxtrace/NextTraceroute)  
+<a href='https://play.google.com/store/apps/details?id=com.surfaceocean.nexttraceroute&pcampaignid=pcampaignidMKT-Other-global-all-co-prtnr-py-PartBadge-Mar2515-1'><img alt='Get it on Google Play' width="128" height="48" src='https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png'/></a>
+
+## JetBrain Support
+
+本项目受 [JetBrain Open-Source Project License](https://jb.gg/OpenSourceSupport) 支持。 很高兴使用`Goland`作为我们的开发工具。
+
+<img src="https://resources.jetbrains.com/storage/products/company/brand/logos/GoLand.png" title="" alt="GoLand logo" width="331">
 
 ## Credits
+
+[Gubo](https://www.gubo.org) 靠谱主机推荐
 
 [IPInfo](https://ipinfo.io) 无偿提供了本项目大部分数据支持
 

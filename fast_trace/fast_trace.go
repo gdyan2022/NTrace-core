@@ -34,6 +34,7 @@ type ParamsFastTrace struct {
 	PktSize        int
 	Timeout        time.Duration
 	File           string
+	DontFragment   bool
 }
 
 type IpListElement struct {
@@ -68,6 +69,7 @@ func (f *FastTracer) tracert(location string, ispCollection ISPCollection) {
 		SrcAddr:          f.ParamsFastTrace.SrcAddr,
 		PktSize:          f.ParamsFastTrace.PktSize,
 		Lang:             f.ParamsFastTrace.Lang,
+		DontFragment:     f.ParamsFastTrace.DontFragment,
 	}
 
 	if oe {
@@ -279,9 +281,9 @@ func testFile(paramsFastTrace ParamsFastTrace, tm bool) {
 			color.New(color.FgYellow, color.Bold).Sprint("『 "+ip.Desc+"』"),
 		)
 		if util.EnableHidDstIP == "" {
-			fmt.Printf("traceroute to %s, %d hops max, %d bytes packets\n", ip.Ip, paramsFastTrace.MaxHops, paramsFastTrace.PktSize)
+			fmt.Printf("traceroute to %s, %d hops max, %d bytes payload\n", ip.Ip, paramsFastTrace.MaxHops, paramsFastTrace.PktSize)
 		} else {
-			fmt.Printf("traceroute to %s, %d hops max, %d bytes packets\n", util.HideIPPart(ip.Ip), paramsFastTrace.MaxHops, paramsFastTrace.PktSize)
+			fmt.Printf("traceroute to %s, %d hops max, %d bytes payload\n", util.HideIPPart(ip.Ip), paramsFastTrace.MaxHops, paramsFastTrace.PktSize)
 		}
 		var srcAddr string
 		if ip.Version4 {
