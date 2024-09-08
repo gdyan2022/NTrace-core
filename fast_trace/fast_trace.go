@@ -161,7 +161,7 @@ func FastTest(tm bool, outEnable bool, paramsFastTrace ParamsFastTrace) {
 		}
 	}
 
-	fmt.Println("您想测试哪些ISP的路由？\n1. 北京三网快速测试\n2. 全国电信\n3. 全国联通\n4. 全国移动\n5. 全国教育网\n6. 全国五网")
+	fmt.Println("您想测试哪些ISP的路由？\n1. 上海三网快速测试\n2. 全国电信\n3. 全国联通\n4. 全国移动\n5. 全国教育网\n6. 全国五网")
 	fmt.Print("请选择选项：")
 	_, err = fmt.Scanln(&c)
 	if err != nil {
@@ -421,9 +421,11 @@ func (f *FastTracer) testEDU() {
 }
 
 func (f *FastTracer) testFast() {
-	f.tracert(TestIPsCollection.Beijing.Location, TestIPsCollection.Beijing.CT163)
-	f.tracert(TestIPsCollection.Beijing.Location, TestIPsCollection.Beijing.CU169)
-	f.tracert(TestIPsCollection.Beijing.Location, TestIPsCollection.Beijing.CM)
-	//f.tracert(TestIPsCollection.Beijing.Location, TestIPsCollection.Beijing.EDU)
-	//f.tracert(TestIPsCollection.Beijing.Location, TestIPsCollection.Beijing.CST)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CT163)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CTCN2)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CU169)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CU9929)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CM)
+	//f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Beijing.EDU)
+	//f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Beijing.CST)
 }
