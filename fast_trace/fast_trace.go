@@ -443,13 +443,15 @@ func (f *FastTracer) testFastBJ() {
 }
 
 func (f *FastTracer) testFastSH() {
-	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Beijing.CT163)
-	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Beijing.CU169)
-	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Beijing.CM)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CT163)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CTCN2)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CU169)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CU9929)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CM)
 }
 
 func (f *FastTracer) testFastGZ() {
-	f.tracert(TestIPsCollection.Guangzhou.Location, TestIPsCollection.Beijing.CT163)
-	f.tracert(TestIPsCollection.Guangzhou.Location, TestIPsCollection.Beijing.CU169)
-	f.tracert(TestIPsCollection.Guangzhou.Location, TestIPsCollection.Beijing.CM)
+	f.tracert(TestIPsCollection.Guangzhou.Location, TestIPsCollection.Guangzhou.CT163)
+	f.tracert(TestIPsCollection.Guangzhou.Location, TestIPsCollection.Guangzhou.CU169)
+	f.tracert(TestIPsCollection.Guangzhou.Location, TestIPsCollection.Guangzhou.CM)
 }
