@@ -444,7 +444,9 @@ func (f *FastTracer) testFastBJ() {
 
 func (f *FastTracer) testFastSH() {
 	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CT163)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CTCN2)
 	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CU169)
+	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CU9929)
 	f.tracert(TestIPsCollection.Shanghai.Location, TestIPsCollection.Shanghai.CM)
 }
 
