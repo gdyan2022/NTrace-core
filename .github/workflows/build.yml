@@ -1,7 +1,7 @@
 name: Build & Release
 
 permissions:
-  contents: read
+  contents: write
 
 defaults:
   run:
@@ -263,7 +263,7 @@ jobs:
           name: ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}
           files: dist_release/*
-          token: ${{ secrets.GT_TOKEN }}
+          # token: ${{ secrets.GT_TOKEN }}
           fail_on_unmatched_files: true
 
   # publish-new-formula:
