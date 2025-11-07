@@ -24,7 +24,6 @@ var (
 	errInvalidMethod      = errors.New("invalid method")
 	errNaturalDone        = errors.New("trace natural done")
 	errTracerouteExecuted = errors.New("traceroute already executed")
-	lastErr               error
 	geoCache              = sync.Map{}
 	ipGeoSF               singleflight.Group
 	rDNSSF                singleflight.Group
@@ -229,6 +228,9 @@ func (s *Result) add(hop Hop, attemptIdx, numMeasurements, maxAttempts int) {
 }
 
 func (s *Result) reduce(final int) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
 	if final > 0 && final < len(s.Hops) {
 		s.Hops = s.Hops[:final]
 	}
@@ -323,6 +325,7 @@ func (h *Hop) fetchIPData(c Config) error {
 				maxRetries = 5
 			}
 
+			var lastErr error
 			for attempt := 0; attempt <= maxRetries; attempt++ {
 				// 超时：2s 起，每次 +1s，上限 6s
 				timeout := time.Duration(2+attempt) * time.Second
@@ -350,6 +353,9 @@ func (h *Hop) fetchIPData(c Config) error {
 				return nil
 			}
 			// 所有尝试均失败
+			if lastErr == nil {
+				lastErr = errors.New("ipgeo: lookup failed without specific error (DN42)")
+			}
 			return lastErr
 		}
 		return nil
@@ -385,6 +391,7 @@ func (h *Hop) fetchIPData(c Config) error {
 			maxRetries = 5
 		}
 
+		var lastErr error
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			// 超时：2s 起，每次 +1s，上限 6s
 			timeout := time.Duration(2+attempt) * time.Second
@@ -413,6 +420,9 @@ func (h *Hop) fetchIPData(c Config) error {
 			return
 		}
 		// 所有尝试均失败
+		if lastErr == nil {
+			lastErr = errors.New("ipgeo: lookup failed without specific error")
+		}
 		ipGeoCh <- lastErr
 	}()
 
