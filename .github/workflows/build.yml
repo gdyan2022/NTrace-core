@@ -47,9 +47,10 @@ jobs:
           - { goos: linux,   goarch: arm,    goarm: 5 }
           - { goos: android, goarch: arm64 }
           - { goos: windows, goarch: arm64 }
-          - { goos: windows, goarch: arm,    goarm: 7, allow_fail: true } # windows/arm 计划于 Go 1.26 移除
+          # windows/arm 已于 Go 1.26 移除
           - { goos: linux,   goarch: arm64 }
           - { goos: linux,   goarch: riscv64 }
+          - { goos: linux,   goarch: loong64 }
           - { goos: linux,   goarch: mips64 }
           - { goos: linux,   goarch: mips64le }
           - { goos: linux,   goarch: mipsle }
@@ -64,14 +65,14 @@ jobs:
           - { goos: openbsd, goarch: arm64 }
           - { goos: openbsd, goarch: arm,    goarm: 7 }
     env:
-      CGO_ENABLED: 0
+      CGO_ENABLED: ${{ matrix.goos == 'android' && 1 || 0 }}
       GOOS:   ${{ matrix.goos }}
       GOARCH: ${{ matrix.goarch }}
       GOARM:  ${{ matrix.goarm }}
       GOMIPS: ${{ matrix.gomips }}
     steps:
       - name: Checkout codebase
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -79,7 +80,7 @@ jobs:
       - name: Set up Go (built-in cache)
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.x'
+          go-version: '1.26.x'
           check-latest: true
           cache: true
 
@@ -87,6 +88,14 @@ jobs:
         run: |
           set -Eeuo pipefail
           go version && go env && echo "Supported targets (dist list):" && go tool dist list | sort -u
+
+      - name: Setup Android NDK
+        if: matrix.goos == 'android'
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
 
       - name: Resolve build metadata
         run: |
@@ -100,7 +109,12 @@ jobs:
           NAME="nexttrace_${GOOS}_${GOARCH}${ARM_SUFFIX}"
           if [ "${GOOS}" = "windows" ]; then NAME="${NAME}.exe"; fi
           if [ "${GOMIPS:-}" = "softfloat" ]; then NAME="${NAME}_softfloat"; fi
-
+          if [ "$GOOS" = "android" ]; then
+            ANDROID_API=21
+            TOOLCHAIN_BIN="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            export CC="$TOOLCHAIN_BIN/aarch64-linux-android${ANDROID_API}-clang"
+            echo "CC=${CC}" >> "$GITHUB_ENV"
+          fi
           echo "BUILD_VERSION=${BUILD_VERSION}" >> "$GITHUB_ENV"
           echo "BUILD_DATE=${BUILD_DATE}"       >> "$GITHUB_ENV"
           echo "COMMIT_SHA1=${COMMIT_SHA1}"     >> "$GITHUB_ENV"
@@ -128,7 +142,7 @@ jobs:
             -ldflags "-X github.com/nxtrace/NTrace-core/config.Version=${BUILD_VERSION} \
                       -X github.com/nxtrace/NTrace-core/config.BuildDate=${BUILD_DATE} \
                       -X github.com/nxtrace/NTrace-core/config.CommitID=${COMMIT_SHA1} \
-                      -checklinkname=0 -w -s"
+                      -w -s"
           if command -v upx >/dev/null 2>&1; then
             case "${GOOS}-${GOARCH}-${GOARM:-}" in
               linux-amd64-*) upx -9 "dist/${ASSET_NAME}" ;;
@@ -144,7 +158,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ASSET_NAME }}
           path: dist/${{ env.ASSET_NAME }}
@@ -161,7 +175,7 @@ jobs:
       GOARCH: ${{ matrix.goarch }}
     steps:
       - name: Checkout codebase
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -169,7 +183,7 @@ jobs:
       - name: Set up Go (built-in cache)
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.x'
+          go-version: '1.26.x'
           check-latest: true
           cache: true
 
@@ -219,10 +233,10 @@ jobs:
             -ldflags "-X github.com/nxtrace/NTrace-core/config.Version=${BUILD_VERSION} \
                       -X github.com/nxtrace/NTrace-core/config.BuildDate=${BUILD_DATE} \
                       -X github.com/nxtrace/NTrace-core/config.CommitID=${COMMIT_SHA1} \
-                      -checklinkname=0 -w -s"
+                      -w -s"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ASSET_NAME }}
           path: dist/${{ env.ASSET_NAME }}
@@ -234,7 +248,7 @@ jobs:
     needs: [ build-darwin ]
     steps:
       - name: Download darwin slices (flatten)
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           pattern: nexttrace_darwin_*
           merge-multiple: true
@@ -256,7 +270,7 @@ jobs:
           ls -l dist
 
       - name: Upload universal as artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: nexttrace_darwin_universal
           path: dist/nexttrace_darwin_universal
@@ -269,7 +283,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download all artifacts (flatten)
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           pattern: nexttrace_*
           merge-multiple: true
