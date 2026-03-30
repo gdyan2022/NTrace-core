@@ -25,6 +25,7 @@ type UDPSpec struct {
 	SrcIP        net.IP
 	DstIP        net.IP
 	DstPort      int
+	SourceDevice string
 	icmp         net.PacketConn
 	udp          net.PacketConn
 	udp4         *ipv4.PacketConn
@@ -62,8 +63,8 @@ func (s *UDPSpec) Close() {
 func (s *UDPSpec) ListenOut(ctx context.Context, ready chan struct{}, onOut func(srcPort, seq, ttl int, start time.Time)) {
 	// 选择捕获设备与本地接口
 	dev := "en0"
-	if util.SrcDev != "" {
-		dev = util.SrcDev
+	if s.SourceDevice != "" {
+		dev = s.SourceDevice
 	} else if d, err := util.PcapDeviceByIP(s.SrcIP); err == nil {
 		dev = d
 	}
@@ -172,6 +173,9 @@ func (s *UDPSpec) SendUDP(ctx context.Context, ipHdr gopacket.NetworkLayer, udpH
 		s.hopLimitLock.Lock()
 		defer s.hopLimitLock.Unlock()
 
+		if err := s.udp4.SetTOS(int(ip4.TOS)); err != nil {
+			return time.Time{}, err
+		}
 		if err := s.udp4.SetTTL(ttl); err != nil {
 			return time.Time{}, err
 		}
@@ -209,6 +213,9 @@ func (s *UDPSpec) SendUDP(ctx context.Context, ipHdr gopacket.NetworkLayer, udpH
 	s.hopLimitLock.Lock()
 	defer s.hopLimitLock.Unlock()
 
+	if err := s.udp6.SetTrafficClass(int(ip6.TrafficClass)); err != nil {
+		return time.Time{}, err
+	}
 	if err := s.udp6.SetHopLimit(ttl); err != nil {
 		return time.Time{}, err
 	}

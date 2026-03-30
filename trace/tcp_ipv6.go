@@ -112,10 +112,11 @@ func (t *TCPTracerIPv6) launchTTL(ctx context.Context, s *internal.TCPSpec, ttl 
 				}
 			}(ttl, i)
 
-			select {
-			case <-ctx.Done():
+			if i+1 == t.MaxAttempts {
 				return
-			case <-time.After(time.Millisecond * time.Duration(t.PacketInterval)):
+			}
+			if !waitForTraceDelay(ctx, time.Millisecond*time.Duration(t.PacketInterval)) {
+				return
 			}
 		}
 	}(ttl)
@@ -135,10 +136,10 @@ func (t *TCPTracerIPv6) clearPending(seq int) bool {
 	return ok
 }
 
-func (t *TCPTracerIPv6) storeSent(seq, srcPort int, start time.Time) {
+func (t *TCPTracerIPv6) storeSent(seq, srcPort, payloadSize int, start time.Time) {
 	t.sentMu.Lock()
 	defer t.sentMu.Unlock()
-	t.sentAt[seq] = sentInfo{srcPort: srcPort, start: start}
+	t.sentAt[seq] = sentInfo{srcPort: srcPort, payloadSize: payloadSize, start: start}
 }
 
 func (t *TCPTracerIPv6) lookupSent(seq int) (srcPort int, start time.Time, ok bool) {
@@ -149,6 +150,12 @@ func (t *TCPTracerIPv6) lookupSent(seq int) (srcPort int, start time.Time, ok bo
 		return 0, time.Time{}, false
 	}
 	return si.srcPort, si.start, true
+}
+
+func (t *TCPTracerIPv6) lookupSentByAck(srcPort, ack int) (seq int, start time.Time, ok bool) {
+	t.sentMu.RLock()
+	defer t.sentMu.RUnlock()
+	return lookupTCPSentByAck(t.sentAt, srcPort, ack)
 }
 
 func (t *TCPTracerIPv6) dropSent(seq int) {
@@ -207,12 +214,18 @@ func (t *TCPTracerIPv6) matchWorker(ctx context.Context) {
 			timer.Stop()
 
 			// 尝试一次匹配
-			srcPort, start, ok := t.lookupSent(task.seq)
-			if !ok {
-				continue
+			var (
+				srcPort int
+				start   time.Time
+				matched bool
+			)
+			if task.ack != 0 {
+				task.seq, start, matched = t.lookupSentByAck(task.srcPort, task.ack)
+				srcPort = task.srcPort
+			} else {
+				srcPort, start, matched = t.lookupSent(task.seq)
 			}
-
-			if task.srcPort != srcPort {
+			if !matched || task.srcPort != srcPort {
 				continue
 			}
 
@@ -271,12 +284,17 @@ func (t *TCPTracerIPv6) Execute() (res *Result, err error) {
 		t.DstPort,
 		t.PktSize,
 	)
+	s.SourceDevice = t.SourceDevice
 
 	s.InitICMP()
 	s.InitTCP()
 	defer s.Close()
 
-	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	baseCtx := t.Context
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	sigCtx, stop := signal.NotifyContext(baseCtx, os.Interrupt, syscall.SIGTERM)
 	ctx, cancel := context.WithCancelCause(sigCtx)
 	t.final.Store(-1)
 
@@ -296,11 +314,11 @@ func (t *TCPTracerIPv6) Execute() (res *Result, err error) {
 	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
-		s.ListenTCP(ctx, t.readyTCP, func(srcPort, seq int, peer net.Addr, finish time.Time) {
+		s.ListenTCP(ctx, t.readyTCP, func(srcPort, seq, ack int, peer net.Addr, finish time.Time) {
 			// 非阻塞投递，队列满则丢弃任务
 			select {
 			case t.matchQ <- matchTask{
-				srcPort: srcPort, seq: seq, peer: peer, finish: finish, mpls: nil,
+				srcPort: srcPort, seq: seq, ack: ack, peer: peer, finish: finish, mpls: nil,
 			}:
 			default:
 				// 丢弃以避免阻塞抓包循环
@@ -321,10 +339,8 @@ func (t *TCPTracerIPv6) Execute() (res *Result, err error) {
 
 		for ttl := t.BeginHop + 1; ttl <= t.MaxHops; ttl++ {
 			// 之后按 TTLInterval 周期启动后续 TTL 组
-			select {
-			case <-ctx.Done():
+			if !waitForTraceDelay(ctx, time.Millisecond*time.Duration(t.TTLInterval)) {
 				return
-			case <-time.After(time.Millisecond * time.Duration(t.TTLInterval)):
 			}
 
 			// 如果到达最终跳，则退出
@@ -354,7 +370,7 @@ func (t *TCPTracerIPv6) Execute() (res *Result, err error) {
 }
 
 func (t *TCPTracerIPv6) handleICMPMessage(msg internal.ReceivedMessage, finish time.Time, data []byte) {
-	mpls := extractMPLS(msg)
+	mpls := extractMPLS(msg, t.DisableMPLS)
 
 	header, err := util.GetICMPResponsePayload(data)
 	if err != nil {
@@ -393,7 +409,7 @@ func (t *TCPTracerIPv6) send(ctx context.Context, s *internal.TCPSpec, ttl, i in
 		return nil
 	}
 
-	if err := t.sem.Acquire(ctx, 1); err != nil {
+	if err := acquireTraceSemaphore(ctx, t.sem); err != nil {
 		return err
 	}
 	defer t.sem.Release(1)
@@ -418,11 +434,12 @@ func (t *TCPTracerIPv6) send(ctx context.Context, s *internal.TCPSpec, ttl, i in
 	}()
 
 	ipHeader := &layers.IPv6{
-		Version:    6,
-		SrcIP:      t.SrcIP,
-		DstIP:      t.DstIP,
-		NextHeader: layers.IPProtocolTCP,
-		HopLimit:   uint8(ttl),
+		Version:      6,
+		SrcIP:        t.SrcIP,
+		DstIP:        t.DstIP,
+		NextHeader:   layers.IPProtocolTCP,
+		HopLimit:     uint8(ttl),
+		TrafficClass: uint8(t.TOS),
 	}
 
 	tcpHeader := &layers.TCP{
@@ -436,7 +453,7 @@ func (t *TCPTracerIPv6) send(ctx context.Context, s *internal.TCPSpec, ttl, i in
 		},
 	}
 
-	desiredPayloadSize := t.PktSize
+	desiredPayloadSize := resolveProbePayloadSize(TCPTrace, t.DstIP, t.PktSize, t.RandomPacketSize)
 	payload := make([]byte, desiredPayloadSize)
 
 	// 设置随机种子
@@ -448,35 +465,30 @@ func (t *TCPTracerIPv6) send(ctx context.Context, s *internal.TCPSpec, ttl, i in
 	// 登记 pending，并启动超时守护
 	t.markPending(seq)
 	go func(seq, ttl, i int) {
-		select {
-		case <-ctx.Done():
+		if !waitForTraceDelay(ctx, t.Timeout) {
 			_ = t.clearPending(seq)
 			return
-		case <-time.After(t.Timeout):
-			// 仍未完成且未超出 final/未达成 ttlComp 才补位
-			if !t.clearPending(seq) {
-				return
-			}
-
-			if f := t.final.Load(); f != -1 && ttl > int(f) {
-				return
-			}
-
-			if t.ttlComp(ttl) {
-				return
-			}
-
-			h := Hop{
-				Success: false,
-				Address: nil,
-				TTL:     ttl,
-				RTT:     0,
-				Error:   errHopLimitTimeout,
-			}
-
-			_, _ = t.res.add(h, i, t.NumMeasurements, t.MaxAttempts)
-			t.dropSent(seq)
 		}
+		if !t.clearPending(seq) {
+			return
+		}
+		if f := t.final.Load(); f != -1 && ttl > int(f) {
+			return
+		}
+		if t.ttlComp(ttl) {
+			return
+		}
+
+		h := Hop{
+			Success: false,
+			Address: nil,
+			TTL:     ttl,
+			RTT:     0,
+			Error:   errHopLimitTimeout,
+		}
+
+		_, _ = t.res.add(h, i, t.NumMeasurements, t.MaxAttempts)
+		t.dropSent(seq)
 	}(seq, ttl, i)
 
 	start, err := s.SendTCP(ctx, ipHeader, tcpHeader, payload)
@@ -484,6 +496,6 @@ func (t *TCPTracerIPv6) send(ctx context.Context, s *internal.TCPSpec, ttl, i in
 		_ = t.clearPending(seq)
 		return err
 	}
-	t.storeSent(seq, SrcPort, start)
+	t.storeSent(seq, SrcPort, desiredPayloadSize, start)
 	return nil
 }

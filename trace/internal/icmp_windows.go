@@ -10,16 +10,13 @@ import (
 	"net"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/nxtrace/NTrace-core/util"
 	wd "github.com/xjasonlyu/windivert-go"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
-	"golang.org/x/sys/windows"
-
-	"github.com/nxtrace/NTrace-core/util"
 )
 
 type ICMPSpec struct {
@@ -31,6 +28,8 @@ type ICMPSpec struct {
 	icmp         net.PacketConn
 	icmp4        *ipv4.PacketConn
 	icmp6        *ipv6.PacketConn
+	sendHandle   wd.Handle
+	sendAddr     wd.Address
 	hopLimitLock sync.Mutex
 }
 
@@ -40,41 +39,16 @@ func ListenPacket(network string, laddr string) (net.PacketConn, error) {
 
 func (s *ICMPSpec) Close() {
 	_ = s.icmp.Close()
-}
-
-// isAdmin 判断当前进程是否具有管理员权限
-func isAdmin() bool {
-	var token windows.Token
-	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); err != nil {
-		return false
+	if s.sendHandle != 0 {
+		_ = s.sendHandle.Close()
 	}
-	defer func() {
-		_ = token.Close()
-	}()
-
-	type tokenElevation struct {
-		TokenIsElevated uint32
-	}
-	var elev tokenElevation
-	var outLen uint32
-
-	if err := windows.GetTokenInformation(
-		token,
-		windows.TokenElevation,
-		(*byte)(unsafe.Pointer(&elev)),
-		uint32(unsafe.Sizeof(elev)),
-		&outLen,
-	); err != nil {
-		return false
-	}
-	return elev.TokenIsElevated != 0
 }
 
 // winDivertAvailable 通过尝试打开一个 WinDivert 嗅探 handle 来判断 WinDivert 是否可用
 func winDivertAvailable() (bool, error) {
 	h, err := wd.Open("false", wd.LayerNetwork, 0, wd.FlagSniff|wd.FlagRecvOnly)
 	if err != nil {
-		return false, fmt.Errorf("WinDivert not available: %v", err)
+		return false, fmt.Errorf("WinDivert 不可用: %v", err)
 	}
 	_ = h.Close()
 	return true, nil
@@ -94,9 +68,9 @@ func (s *ICMPSpec) resolveICMPMode() int {
 	}
 
 	// Auto(0) 或强制 Sniff(2) → 尝试 WinDivert
-	if !isAdmin() {
+	if !util.HasAdminPrivileges() {
 		if icmpMode == 2 {
-			log.Printf("WinDivert sniff mode requested, but administrator privilege is required; falling back to Socket mode.")
+			log.Printf("请求使用 WinDivert 嗅探模式，但当前缺少管理员权限；已回退到 Socket 模式。")
 		}
 		return 1
 	}
@@ -104,7 +78,7 @@ func (s *ICMPSpec) resolveICMPMode() int {
 	ok, err := winDivertAvailable()
 	if !ok {
 		if icmpMode == 2 {
-			log.Printf("WinDivert sniff mode requested, but WinDivert is not available: %v; falling back to Socket mode.", err)
+			log.Printf("请求使用 WinDivert 嗅探模式，但 WinDivert 不可用: %v；已回退到 Socket 模式。", err)
 		}
 		return 1
 	}
@@ -121,204 +95,40 @@ func (s *ICMPSpec) ListenICMP(ctx context.Context, ready chan struct{}, onICMP f
 }
 
 func (s *ICMPSpec) listenICMPWinDivert(ctx context.Context, ready chan struct{}, onICMP func(msg ReceivedMessage, finish time.Time, seq int)) {
-	// 构造 WinDivert 过滤器：入站 ICMP/ICMPv6，目标为本机 s.SrcIP
-	var filter string
-	if s.IPVersion == 4 {
-		filter = fmt.Sprintf("inbound and icmp and ip.DstAddr == %s", s.SrcIP.String())
-	} else {
-		filter = fmt.Sprintf("inbound and icmpv6 and ipv6.DstAddr == %s", s.SrcIP.String())
-	}
-
-	// 以嗅探模式（FlagSniff）打开 WinDivert：只复制匹配的包，不拦截
-	handle, err := wd.Open(filter, wd.LayerNetwork, 0, wd.FlagSniff|wd.FlagRecvOnly)
-	if err != nil {
-		if util.EnvDevMode {
-			panic(fmt.Errorf("(ListenICMP) WinDivert open failed: %v (filter=%q)", err, filter))
-		}
-		log.Fatalf("(ListenICMP) WinDivert open failed: %v (filter=%q)", err, filter)
-	}
-	var closeOnce sync.Once
-	closeHandle := func() { closeOnce.Do(func() { _ = handle.Close() }) }
+	handle, closeHandle := openWinDivertSniffHandle(ctx, winDivertICMPFilter(s.IPVersion, s.SrcIP), "ListenICMP")
 	defer closeHandle()
-
-	// context 取消时关闭 handle，使阻塞的 Recv() 立即返回错误
-	go func() {
-		<-ctx.Done()
-		closeHandle()
-	}()
-
-	// 增大队列防丢包
-	_ = handle.SetParam(wd.QueueLength, 8192)
-	_ = handle.SetParam(wd.QueueTime, 4000) // 4s
-
 	close(ready)
 
 	buf := make([]byte, 65535)
 	var addr wd.Address
 
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		n, err := handle.Recv(buf, &addr)
-		if err != nil {
-			select {
-			case <-ctx.Done():
+		raw, finish, ok := receiveWinDivertPacket(ctx, handle, buf, &addr)
+		if !ok {
+			if ctx.Err() != nil {
 				return
-			default:
 			}
 			continue
 		}
 
-		finish := time.Now()
-		raw := make([]byte, n)
-		copy(raw, buf[:n])
-
-		// WinDivert 返回的数据从 IP 头开始，直接用 gopacket 解码
-		var firstLayer gopacket.Decoder
-		if s.IPVersion == 4 {
-			firstLayer = layers.LayerTypeIPv4
-		} else {
-			firstLayer = layers.LayerTypeIPv6
-		}
-		pkt := gopacket.NewPacket(raw, firstLayer, gopacket.NoCopy)
-
-		// outer = 完整 IP 报文字节（WinDivert 已从 IP 头开始）
-		outer := raw
-
-		var peerIP net.IP // 提取对端 IP（按族别）
-		var data []byte   // 提取 ICMP 的负载
-		if s.IPVersion == 4 {
-			// 从包中获取 IPv4 层信息
-			ip4, ok := pkt.Layer(layers.LayerTypeIPv4).(*layers.IPv4)
-			if !ok || ip4 == nil {
-				continue
-			}
-			peerIP = ip4.SrcIP
-
-			// 从包中获取 ICMPv4 层信息
-			ic4, ok := pkt.Layer(layers.LayerTypeICMPv4).(*layers.ICMPv4)
-			if !ok || ic4 == nil {
-				continue
-			}
-			data = ic4.Payload
-
-			switch ic4.TypeCode.Type() {
-			case layers.ICMPv4TypeEchoReply:
-				if !peerIP.Equal(s.DstIP) {
-					continue
-				}
-
-				id := int(ic4.Id)
-				if id != s.EchoID {
-					continue
-				}
-				peer := &net.IPAddr{IP: peerIP}
-
-				msg := ReceivedMessage{
-					Peer: peer,
-					Msg:  outer,
-				}
-				seq := int(ic4.Seq)
-				onICMP(msg, finish, seq)
-				continue
-			case layers.ICMPv4TypeTimeExceeded:
-			case layers.ICMPv4TypeDestinationUnreachable:
-			default:
-				continue
-			}
-
-			if len(data) < 20 || data[0]>>4 != 4 {
-				continue
-			}
-
-			dstIP := net.IP(data[16:20])
-			if !dstIP.Equal(s.DstIP) {
-				continue
-			}
-		} else {
-			// 从包中获取 IPv6 层信息
-			ip6, ok := pkt.Layer(layers.LayerTypeIPv6).(*layers.IPv6)
-			if !ok || ip6 == nil {
-				continue
-			}
-			peerIP = ip6.SrcIP
-
-			// 从包中获取 ICMPv6 层信息
-			ic6, ok := pkt.Layer(layers.LayerTypeICMPv6).(*layers.ICMPv6)
-			if !ok || ic6 == nil {
-				continue
-			}
-			if len(ic6.Payload) < 4 {
-				continue
-			}
-			data = ic6.Payload[4:]
-
-			switch ic6.TypeCode.Type() {
-			case layers.ICMPv6TypeEchoReply:
-				echo, ok := pkt.Layer(layers.LayerTypeICMPv6Echo).(*layers.ICMPv6Echo)
-				if !ok || echo == nil {
-					continue
-				}
-
-				if !peerIP.Equal(s.DstIP) {
-					continue
-				}
-
-				id := int(echo.Identifier)
-				if id != s.EchoID {
-					continue
-				}
-				peer := &net.IPAddr{IP: peerIP}
-
-				msg := ReceivedMessage{
-					Peer: peer,
-					Msg:  outer,
-				}
-				seq := int(echo.SeqNumber)
-				onICMP(msg, finish, seq)
-				continue
-			case layers.ICMPv6TypeTimeExceeded:
-			case layers.ICMPv6TypePacketTooBig:
-			case layers.ICMPv6TypeDestinationUnreachable:
-			default:
-				continue
-			}
-
-			if len(data) < 40 || data[0]>>4 != 6 {
-				continue
-			}
-
-			dstIP := net.IP(data[24:40])
-			if !dstIP.Equal(s.DstIP) {
-				continue
-			}
-		}
-		peer := &net.IPAddr{IP: peerIP}
-
-		msg := ReceivedMessage{
-			Peer: peer,
-			Msg:  outer,
-		}
-
-		header, err := util.GetICMPResponsePayload(data)
-		if err != nil {
+		packet, ok := decodeWinDivertICMPPacket(s.IPVersion, raw)
+		if !ok {
 			continue
 		}
 
-		id, err := util.GetICMPID(header)
-		if err != nil || id != s.EchoID {
+		msg := packet.message()
+		if seq, ok := packet.echoReplyFor(s.DstIP, s.EchoID); ok {
+			onICMP(msg, finish, seq)
 			continue
 		}
 
-		seq, err := util.GetICMPSeq(header)
-		if err != nil {
+		data, ok := packet.errorPayloadFor(s.DstIP)
+		if !ok {
 			continue
 		}
-		onICMP(msg, finish, seq)
+		if seq, ok := extractEmbeddedICMPSeq(data, s.EchoID); ok {
+			onICMP(msg, finish, seq)
+		}
 	}
 }
 
@@ -351,6 +161,9 @@ func (s *ICMPSpec) SendICMP(ctx context.Context, ipHdr gopacket.NetworkLayer, ic
 		s.hopLimitLock.Lock()
 		defer s.hopLimitLock.Unlock()
 
+		if err := s.icmp4.SetTOS(int(ip4.TOS)); err != nil {
+			return time.Time{}, err
+		}
 		if err := s.icmp4.SetTTL(ttl); err != nil {
 			return time.Time{}, err
 		}
@@ -378,13 +191,17 @@ func (s *ICMPSpec) SendICMP(ctx context.Context, ipHdr gopacket.NetworkLayer, ic
 		return time.Time{}, fmt.Errorf("SetNetworkLayerForChecksum: %w", err)
 	}
 
+	if shouldUseICMPv6RawSend(ip6) {
+		return s.sendICMPv6WithWinDivert(ip6, icmpHdr, icmpEcho, payload)
+	}
+
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{
 		ComputeChecksums: true,
 		FixLengths:       true,
 	}
 
-	// 序列化 ICMP 头与 payload 到缓冲区
+	// Socket path only needs the ICMPv6 payload; the kernel prepends the IPv6 header.
 	if err := gopacket.SerializeLayers(buf, opts, icmpHdr, icmpEcho, gopacket.Payload(payload)); err != nil {
 		return time.Time{}, err
 	}
@@ -403,4 +220,55 @@ func (s *ICMPSpec) SendICMP(ctx context.Context, ipHdr gopacket.NetworkLayer, ic
 		return time.Time{}, err
 	}
 	return start, nil
+}
+
+func shouldUseICMPv6RawSend(ip6 *layers.IPv6) bool {
+	return ip6 != nil && ip6.TrafficClass != 0
+}
+
+func (s *ICMPSpec) sendICMPv6WithWinDivert(ip6 *layers.IPv6, icmpHdr, icmpEcho gopacket.SerializableLayer, payload []byte) (time.Time, error) {
+	s.hopLimitLock.Lock()
+	defer s.hopLimitLock.Unlock()
+
+	if err := s.ensureICMPSendHandle(true); err != nil {
+		return time.Time{}, err
+	}
+
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{
+		ComputeChecksums: true,
+		FixLengths:       true,
+	}
+	if err := gopacket.SerializeLayers(buf, opts, ip6, icmpHdr, icmpEcho, gopacket.Payload(payload)); err != nil {
+		return time.Time{}, err
+	}
+
+	start := time.Now()
+	if _, err := s.sendHandle.Send(buf.Bytes(), &s.sendAddr); err != nil {
+		return time.Time{}, err
+	}
+	return start, nil
+}
+
+func (s *ICMPSpec) ensureICMPSendHandle(ipv6 bool) error {
+	if s.sendHandle != 0 {
+		return nil
+	}
+
+	handle, err := wd.Open("false", wd.LayerNetwork, 0, 0)
+	if err != nil {
+		if ipv6 {
+			return fmt.Errorf("ICMPv6 --tos on Windows requires WinDivert send support: %w", err)
+		}
+		return err
+	}
+
+	s.sendHandle = handle
+	s.sendAddr.SetLayer(wd.LayerNetwork)
+	s.sendAddr.SetEvent(wd.EventNetworkPacket)
+	s.sendAddr.SetOutbound()
+	if ipv6 {
+		s.sendAddr.SetIPv6()
+	}
+	return nil
 }

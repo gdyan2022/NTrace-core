@@ -1,6 +1,6 @@
 module github.com/nxtrace/NTrace-core
 
-go 1.26.0
+go 1.26.1
 
 require (
 	github.com/akamensky/argparse v1.4.0
@@ -9,19 +9,19 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/gorilla/websocket v1.5.3
 	github.com/jsdelivr/globalping-cli v1.5.1
-	github.com/mattn/go-runewidth v0.0.20
+	github.com/mattn/go-runewidth v0.0.21
 	github.com/oschwald/maxminddb-golang v1.13.1
-	github.com/rodaine/table v1.3.0
+	github.com/rodaine/table v1.3.1
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
 	github.com/syndtr/gocapability v0.0.0-20200815063812-42c35b437635
 	github.com/tidwall/gjson v1.18.0
 	github.com/tsosunchia/powclient v0.2.0
 	github.com/xjasonlyu/windivert-go v0.0.0-20201010013527-4239d0afa76f
-	golang.org/x/net v0.51.0
-	golang.org/x/sync v0.19.0
-	golang.org/x/sys v0.41.0
-	golang.org/x/term v0.40.0
+	golang.org/x/net v0.52.0
+	golang.org/x/sync v0.20.0
+	golang.org/x/sys v0.42.0
+	golang.org/x/term v0.41.0
 )
 
 require (
@@ -64,8 +64,8 @@ require (
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/arch v0.22.0 // indirect
-	golang.org/x/crypto v0.48.0 // indirect
-	golang.org/x/text v0.34.0 // indirect
+	golang.org/x/crypto v0.49.0 // indirect
+	golang.org/x/text v0.35.0 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

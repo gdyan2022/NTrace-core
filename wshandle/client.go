@@ -1,7 +1,9 @@
 package wshandle
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -27,6 +29,17 @@ func formatHostPort(addr, port string) string {
 	return clean + ":" + port
 }
 
+type wsWriteJob struct {
+	msgType int
+	data    []byte
+}
+
+const (
+	wsClientWriteQueueSize = 1024
+	wsClientWriteTimeout   = 5 * time.Second
+	wsClientDialTimeout    = 5 * time.Second
+)
+
 type WsConn struct {
 	Connecting   bool
 	Connected    bool            // 连接状态
@@ -38,6 +51,14 @@ type WsConn struct {
 	Conn         *websocket.Conn // 主连接
 	ConnMux      sync.Mutex      // 连接互斥锁
 	stateMu      sync.RWMutex
+	lifecycleMu  sync.Mutex
+	loopWG       sync.WaitGroup
+	closeOnce    sync.Once
+	writeCh      chan wsWriteJob // serialized write queue
+	writeStop    chan struct{}   // signals writeLoop to exit
+	closeCh      chan struct{}   // signals background loops to exit
+	closed       bool
+	baseCtx      context.Context
 }
 
 func (c *WsConn) getConn() *websocket.Conn {
@@ -64,11 +85,185 @@ func (c *WsConn) setDoneChan(done chan struct{}) {
 	c.stateMu.Unlock()
 }
 
+// initWriteLoop creates the write channel and starts the single writer goroutine.
+// Must be called once when the WsConn is created.
+func (c *WsConn) initWriteLoop() {
+	c.writeCh = make(chan wsWriteJob, wsClientWriteQueueSize)
+	c.writeStop = make(chan struct{})
+	c.startLoop(c.writeLoop)
+}
+
+// writeLoop is the sole goroutine allowed to call conn.WriteMessage.
+func (c *WsConn) writeLoop() {
+	for {
+		select {
+		case <-c.writeStop:
+			return
+		case job, ok := <-c.writeCh:
+			if !ok {
+				return
+			}
+			conn := c.getConn()
+			if conn == nil {
+				c.setConnected(false)
+				continue
+			}
+			_ = conn.SetWriteDeadline(time.Now().Add(wsClientWriteTimeout))
+			if err := conn.WriteMessage(job.msgType, job.data); err != nil {
+				log.Printf("wshandle writeLoop: %v", err)
+				c.setConnected(false)
+			}
+		}
+	}
+}
+
+// enqueueWrite sends a write job to the writeLoop. Returns an error if the
+// queue is full or writeLoop has stopped.
+func (c *WsConn) enqueueWrite(job wsWriteJob) error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.closed {
+		return errWriteLoopStopped
+	}
+	select {
+	case c.writeCh <- job:
+		return nil
+	case <-c.writeStop:
+		return errWriteLoopStopped
+	default:
+		return errWriteQueueFull
+	}
+}
+
+var (
+	errWriteQueueFull   = errors.New("wshandle: write queue full")
+	errWriteLoopStopped = errors.New("wshandle: write loop stopped")
+)
+
 var wsconn *WsConn
+var wsconnMu sync.RWMutex
+var wsconnNewMu sync.Mutex
 var host, port, fastIp string
 var envToken = util.EnvToken
 var cacheToken string
 var cacheTokenFailedTimes int
+var createWsConnFn = createWsConn
+var wsGetFastIPFn = util.GetFastIPWithContext
+var wsGetTokenFn = pow.GetTokenWithContext
+
+func newWsConn(conn *websocket.Conn, interrupt chan os.Signal) *WsConn {
+	c := &WsConn{
+		Conn:         conn,
+		MsgSendCh:    make(chan string, 10),
+		MsgReceiveCh: make(chan string, 10),
+		Interrupt:    interrupt,
+		closeCh:      make(chan struct{}),
+		baseCtx:      context.Background(),
+	}
+	c.initWriteLoop()
+	return c
+}
+
+func normalizeContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func deriveOperationContext(parent context.Context, stopCh <-chan struct{}, timeout time.Duration) (context.Context, context.CancelFunc) {
+	base := normalizeContext(parent)
+	linkedCtx, linkedCancel := context.WithCancel(base)
+	if stopCh != nil {
+		go func() {
+			select {
+			case <-stopCh:
+				linkedCancel()
+			case <-linkedCtx.Done():
+			}
+		}()
+	}
+	if timeout <= 0 {
+		return linkedCtx, linkedCancel
+	}
+	ctx, cancel := context.WithTimeout(linkedCtx, timeout)
+	return ctx, func() {
+		cancel()
+		linkedCancel()
+	}
+}
+
+func (c *WsConn) startLoop(fn func()) {
+	c.loopWG.Add(1)
+	go func() {
+		defer c.loopWG.Done()
+		fn()
+	}()
+}
+
+func (c *WsConn) isClosed() bool {
+	if c == nil {
+		return true
+	}
+	select {
+	case <-c.closeCh:
+		return true
+	default:
+		return false
+	}
+}
+
+func closeSignalChan(ch chan struct{}) {
+	if ch == nil {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	close(ch)
+}
+
+func (c *WsConn) closeConn() {
+	conn := c.getConn()
+	if conn == nil {
+		return
+	}
+	_ = conn.Close()
+	c.setConn(nil)
+}
+
+func (c *WsConn) replaceConn(conn *websocket.Conn) {
+	c.stateMu.Lock()
+	prev := c.Conn
+	c.Conn = conn
+	c.stateMu.Unlock()
+	if prev != nil && prev != conn {
+		_ = prev.Close()
+	}
+}
+
+func (c *WsConn) Close() {
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() {
+		c.lifecycleMu.Lock()
+		c.closed = true
+		c.lifecycleMu.Unlock()
+
+		c.setConnectionState(false, false)
+		if c.closeCh != nil {
+			close(c.closeCh)
+		}
+		closeSignalChan(c.writeStop)
+		closeSignalChan(c.getDoneChan())
+		if c.Interrupt != nil {
+			signal.Stop(c.Interrupt)
+		}
+		c.closeConn()
+	})
+	c.loopWG.Wait()
+}
 
 func (c *WsConn) setConnectionState(connected, connecting bool) {
 	c.stateMu.Lock()
@@ -102,6 +297,9 @@ func (c *WsConn) IsConnecting() bool {
 }
 
 func (c *WsConn) startReconnecting() bool {
+	if c.isClosed() {
+		return false
+	}
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 	if c.Connected || c.Connecting {
@@ -112,47 +310,43 @@ func (c *WsConn) startReconnecting() bool {
 }
 
 func (c *WsConn) keepAlive() {
-	go func() {
-		// 开启一个定时器
-		for {
-			<-time.After(time.Second * 54)
-			if c.IsConnected() {
-				conn := c.getConn()
-				if conn == nil {
-					c.setConnected(false)
-					continue
-				}
-				err := conn.WriteMessage(websocket.TextMessage, []byte("ping"))
-				if err != nil {
-					log.Println(err)
-					c.setConnected(false)
-					return
-				}
+	pingTicker := time.NewTicker(54 * time.Second)
+	defer pingTicker.Stop()
+	reconnectTicker := time.NewTicker(200 * time.Millisecond)
+	defer reconnectTicker.Stop()
+
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case <-pingTicker.C:
+			if !c.IsConnected() {
+				continue
+			}
+			if err := c.enqueueWrite(wsWriteJob{
+				msgType: websocket.TextMessage,
+				data:    []byte("ping"),
+			}); err != nil {
+				log.Println(err)
+				c.setConnected(false)
+			}
+		case <-reconnectTicker.C:
+			if c.startReconnecting() {
+				c.recreateWsConn()
 			}
 		}
-	}()
-	for {
-		if c.startReconnecting() {
-			c.recreateWsConn()
-		}
-		// 降低检测频率，优化 CPU 占用情况
-		<-time.After(200 * time.Millisecond)
 	}
 }
 
 func (c *WsConn) messageReceiveHandler() {
 	done := c.getDoneChan()
-	defer func() {
-		if done == nil {
-			return
-		}
-		select {
-		case <-done:
-		default:
-			close(done)
-		}
-	}()
+	defer closeSignalChan(done)
 	for {
+		select {
+		case <-c.closeCh:
+			return
+		default:
+		}
 		if c.IsConnected() {
 			conn := c.getConn()
 			if conn == nil {
@@ -167,12 +361,75 @@ func (c *WsConn) messageReceiveHandler() {
 				return
 			}
 			if string(msg) != "pong" {
-				c.MsgReceiveCh <- string(msg)
+				select {
+				case c.MsgReceiveCh <- string(msg):
+				case <-c.closeCh:
+					return
+				}
 			}
 		} else {
 			// 降低断线时期的 CPU 占用
-			time.Sleep(200 * time.Millisecond)
+			select {
+			case <-c.closeCh:
+				return
+			case <-time.After(200 * time.Millisecond):
+			}
 		}
+	}
+}
+
+func apiServerErrorMessage(ip string) string {
+	return `{"ip":"` + ip + `", "asnumber":"API Server Error"}`
+}
+
+func (c *WsConn) trySendReceiveMessage(msg string) {
+	select {
+	case c.MsgReceiveCh <- msg:
+	case <-c.closeCh:
+	default:
+		log.Println("wshandle: dropping queued receive message")
+	}
+}
+
+func (c *WsConn) waitForNextDoneChan(doneCh chan struct{}) chan struct{} {
+	for {
+		newDone := c.getDoneChan()
+		if newDone != nil && newDone != doneCh {
+			return newDone
+		}
+		select {
+		case <-c.closeCh:
+			return nil
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func (c *WsConn) sendQueuedMessage(msg string) {
+	if !c.IsConnected() {
+		c.trySendReceiveMessage(apiServerErrorMessage(msg))
+		return
+	}
+
+	if err := c.enqueueWrite(wsWriteJob{
+		msgType: websocket.TextMessage,
+		data:    []byte(msg),
+	}); err != nil {
+		log.Println("write:", err)
+		c.setConnected(false)
+		c.trySendReceiveMessage(apiServerErrorMessage(msg))
+	}
+}
+
+func (c *WsConn) handleInterrupt(doneCh chan struct{}) {
+	_ = c.enqueueWrite(wsWriteJob{
+		msgType: websocket.CloseMessage,
+		data:    websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+	})
+
+	select {
+	case <-doneCh:
+	case <-time.After(1 * time.Second):
 	}
 }
 
@@ -182,66 +439,43 @@ func (c *WsConn) messageSendHandler() {
 		if current := c.getDoneChan(); current != nil && current != doneCh {
 			doneCh = current
 		}
-		// 循环监听发送
+
 		select {
+		case <-c.closeCh:
+			return
 		case <-doneCh:
-			for {
-				newDone := c.getDoneChan()
-				if newDone != nil && newDone != doneCh {
-					doneCh = newDone
-					break
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-			continue
-		case t := <-c.MsgSendCh:
-			// log.Println(t)
-			if !c.IsConnected() {
-				c.MsgReceiveCh <- `{"ip":"` + t + `", "asnumber":"API Server Error"}`
-				continue
-			}
-			conn := c.getConn()
-			if conn == nil {
-				c.MsgReceiveCh <- `{"ip":"` + t + `", "asnumber":"API Server Error"}`
-				continue
-			}
-			if err := conn.WriteMessage(websocket.TextMessage, []byte(t)); err != nil {
-				log.Println("write:", err)
-				c.setConnected(false)
-				c.MsgReceiveCh <- `{"ip":"` + t + `", "asnumber":"API Server Error"}`
-				continue
-			}
-		// 来自终端的中断运行请求
-		case <-c.Interrupt:
-			// 向 websocket 发起关闭连接任务
-			conn := c.getConn()
-			if conn == nil {
+			doneCh = c.waitForNextDoneChan(doneCh)
+			if doneCh == nil {
 				return
 			}
-			err := conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			if err != nil {
-				if util.EnvDevMode {
-					panic(err)
-				}
-				log.Printf("write close: %v", err)
-			}
-			select {
-			// 等到了结果，直接退出
-			case <-doneCh:
-			// 如果等待 1s 还是拿不到结果，不再等待，超时退出
-			case <-time.After(1 * time.Second):
-			}
+		case msg := <-c.MsgSendCh:
+			c.sendQueuedMessage(msg)
+		case <-c.Interrupt:
+			c.handleInterrupt(doneCh)
 			return
 		}
 	}
 }
 
 func (c *WsConn) recreateWsConn() {
+	if c.isClosed() {
+		return
+	}
 	c.setConnected(false)
 	// 尝试重新连线
 	if host != "" && net.ParseIP(host) == nil {
 		// 刷新一次最优 IP，防止旧 IP 已失效
-		fastIp = util.GetFastIP(host, port, true)
+		fastIPCtx, cancelFastIP := deriveOperationContext(c.baseCtx, c.closeCh, 0)
+		refreshedFastIP, err := wsGetFastIPFn(fastIPCtx, host, port, true)
+		cancelFastIP()
+		if err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("fast ip refresh failed: %v", err)
+			}
+			c.setConnectionState(false, false)
+			return
+		}
+		fastIp = refreshedFastIP
 	}
 	u := url.URL{Scheme: "wss", Host: formatHostPort(fastIp, port), Path: "/v3/ipGeoWs"}
 	// log.Printf("connecting to %s", u.String())
@@ -251,16 +485,20 @@ func (c *WsConn) recreateWsConn() {
 		// 无环境变量 token
 		if cacheToken == "" {
 			// 无cacheToken, 重新获取 token
+			tokenCtx, cancelToken := deriveOperationContext(c.baseCtx, c.closeCh, 0)
 			if util.GetPowProvider() == "" {
-				jwtToken, err = pow.GetToken(fastIp, host, port)
+				jwtToken, err = wsGetTokenFn(tokenCtx, fastIp, host, port)
 			} else {
-				jwtToken, err = pow.GetToken(util.GetPowProvider(), util.GetPowProvider(), port)
+				jwtToken, err = wsGetTokenFn(tokenCtx, util.GetPowProvider(), util.GetPowProvider(), port)
 			}
+			cancelToken()
 			if err != nil {
 				if util.EnvDevMode {
 					panic(err)
 				}
-				log.Printf("pow token fetch failed: %v", err)
+				if !errors.Is(err, context.Canceled) {
+					log.Printf("pow token fetch failed: %v", err)
+				}
 				cacheToken = ""
 				cacheTokenFailedTimes++
 				c.setConnectionState(false, false)
@@ -287,8 +525,15 @@ func (c *WsConn) recreateWsConn() {
 	if proxyUrl != nil {
 		dialer.Proxy = http.ProxyURL(proxyUrl)
 	}
-	ws, _, err := dialer.Dial(u.String(), requestHeader)
-	c.setConn(ws)
+	ctx, cancel := deriveOperationContext(c.baseCtx, c.closeCh, wsClientDialTimeout)
+	ws, _, err := dialer.DialContext(ctx, u.String(), requestHeader)
+	cancel()
+	if c.isClosed() {
+		if ws != nil {
+			_ = ws.Close()
+		}
+		return
+	}
 	if err != nil {
 		log.Println("dial:", err)
 		// <-time.After(time.Second * 1)
@@ -298,18 +543,20 @@ func (c *WsConn) recreateWsConn() {
 		//fmt.Println("重连失败", cacheTokenFailedTimes, "次")
 		return
 	}
-	c.setConnectionState(err == nil, false)
+	c.replaceConn(ws)
+	c.setConnectionState(true, false)
 
 	c.setDoneChan(make(chan struct{}))
-	go c.messageReceiveHandler()
+	c.startLoop(c.messageReceiveHandler)
 }
 
-func createWsConn() *WsConn {
+func createWsConn(ctx context.Context) *WsConn {
 	proxyUrl := util.GetProxy()
 	//fmt.Println("正在连接 WS")
 	// 设置终端中断通道
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
+	ctx = normalizeContext(ctx)
 	host, port = util.GetHostAndPort()
 	// 如果 host 是一个 IP 使用默认域名
 	if valid := net.ParseIP(host); valid != nil {
@@ -317,31 +564,41 @@ func createWsConn() *WsConn {
 		host = "api.nxtrace.org"
 	} else {
 		// 默认配置完成，开始寻找最优 IP
-		fastIp = util.GetFastIP(host, port, true)
+		refreshedFastIP, err := wsGetFastIPFn(ctx, host, port, true)
+		if err != nil {
+			if util.EnvDevMode {
+				panic(err)
+			}
+			log.Printf("fast ip probe failed: %v", err)
+			ws := newWsConn(nil, interrupt)
+			ws.baseCtx = ctx
+			ws.setDoneChan(make(chan struct{}))
+			ws.setConnectionState(false, false)
+			ws.startLoop(ws.keepAlive)
+			ws.startLoop(ws.messageSendHandler)
+			return ws
+		}
+		fastIp = refreshedFastIP
 	}
 	jwtToken, ua := envToken, []string{"Privileged Client"}
 	err := error(nil)
 	if envToken == "" {
 		if util.GetPowProvider() == "" {
-			jwtToken, err = pow.GetToken(fastIp, host, port)
+			jwtToken, err = wsGetTokenFn(ctx, fastIp, host, port)
 		} else {
-			jwtToken, err = pow.GetToken(util.GetPowProvider(), util.GetPowProvider(), port)
+			jwtToken, err = wsGetTokenFn(ctx, util.GetPowProvider(), util.GetPowProvider(), port)
 		}
 		if err != nil {
 			if util.EnvDevMode {
 				panic(err)
 			}
 			log.Printf("pow token fetch failed: %v", err)
-			wsconn = &WsConn{
-				MsgSendCh:    make(chan string, 10),
-				MsgReceiveCh: make(chan string, 10),
-				Done:         make(chan struct{}),
-				Interrupt:    interrupt,
-			}
-			wsconn.setConnectionState(false, false)
-			go wsconn.keepAlive()
-			go wsconn.messageSendHandler()
-			return wsconn
+			ws := newWsConn(nil, interrupt)
+			ws.setDoneChan(make(chan struct{}))
+			ws.setConnectionState(false, false)
+			ws.startLoop(ws.keepAlive)
+			ws.startLoop(ws.messageSendHandler)
+			return ws
 		}
 		ua = []string{util.UserAgent}
 	}
@@ -363,38 +620,58 @@ func createWsConn() *WsConn {
 	u := url.URL{Scheme: "wss", Host: formatHostPort(fastIp, port), Path: "/v3/ipGeoWs"}
 	// log.Printf("connecting to %s", u.String())
 
-	c, _, err := dialer.Dial(u.String(), requestHeader)
+	dialCtx, cancel := deriveOperationContext(ctx, nil, wsClientDialTimeout)
+	c, _, err := dialer.DialContext(dialCtx, u.String(), requestHeader)
+	cancel()
 
-	wsconn = &WsConn{
-		Conn:         c,
-		MsgSendCh:    make(chan string, 10),
-		MsgReceiveCh: make(chan string, 10),
-		Interrupt:    interrupt,
-	}
-	wsconn.setConnectionState(err == nil, false)
+	ws := newWsConn(c, interrupt)
+	ws.baseCtx = ctx
+	ws.setConnectionState(err == nil, false)
 
 	if err != nil {
 		log.Println("dial:", err)
 		// <-time.After(time.Second * 1)
 		cacheTokenFailedTimes++
-		wsconn.setDoneChan(make(chan struct{}))
-		go wsconn.keepAlive()
-		go wsconn.messageSendHandler()
-		return wsconn
+		ws.setDoneChan(make(chan struct{}))
+		ws.startLoop(ws.keepAlive)
+		ws.startLoop(ws.messageSendHandler)
+		return ws
 	}
 	// defer c.Close()
 	// 将连接写入WsConn，方便随时可取
-	wsconn.setDoneChan(make(chan struct{}))
-	go wsconn.keepAlive()
-	go wsconn.messageReceiveHandler()
-	go wsconn.messageSendHandler()
-	return wsconn
+	ws.setDoneChan(make(chan struct{}))
+	ws.startLoop(ws.keepAlive)
+	ws.startLoop(ws.messageReceiveHandler)
+	ws.startLoop(ws.messageSendHandler)
+	return ws
+}
+
+func NewWithContext(ctx context.Context) *WsConn {
+	wsconnNewMu.Lock()
+	defer wsconnNewMu.Unlock()
+
+	newConn := createWsConnFn(ctx)
+	if newConn != nil {
+		newConn.baseCtx = normalizeContext(ctx)
+	}
+
+	wsconnMu.Lock()
+	oldConn := wsconn
+	wsconn = newConn
+	wsconnMu.Unlock()
+
+	if oldConn != nil && oldConn != newConn {
+		oldConn.Close()
+	}
+	return newConn
 }
 
 func New() *WsConn {
-	return createWsConn()
+	return NewWithContext(context.Background())
 }
 
 func GetWsConn() *WsConn {
+	wsconnMu.RLock()
+	defer wsconnMu.RUnlock()
 	return wsconn
 }

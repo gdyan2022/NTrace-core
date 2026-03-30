@@ -2,7 +2,9 @@ package fastTrace
 
 import (
 	"bufio"
+	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -26,6 +28,7 @@ type FastTracer struct {
 }
 
 type ParamsFastTrace struct {
+	Context        context.Context
 	OSType         int
 	ICMPMode       int
 	SrcDev         string
@@ -38,9 +41,12 @@ type ParamsFastTrace struct {
 	AlwaysWaitRDNS bool
 	Lang           string
 	PktSize        int
+	PacketSizeSet  bool
+	TOS            int
 	Timeout        time.Duration
 	File           string
 	Dot            string
+	OutputPath     string
 }
 
 type IpListElement struct {
@@ -49,158 +55,86 @@ type IpListElement struct {
 	Version4 bool // true for IPv4, false for IPv6
 }
 
-var oe = false
-
-func (f *FastTracer) tracert(location string, ispCollection ISPCollection) {
-	fmt.Fprintf(color.Output, "%s\n", color.New(color.FgYellow, color.Bold).Sprintf("『%s %s 』", location, ispCollection.ISPName))
-	fmt.Printf("traceroute to %s, %d hops max, %d byte packets, %s mode\n", ispCollection.IP, f.ParamsFastTrace.MaxHops, f.ParamsFastTrace.PktSize, strings.ToUpper(string(f.TracerouteMethod)))
-
-	// ip, err := util.DomainLookUp(ispCollection.IP, "4", "", true)
-	ip, err := util.DomainLookUp(ispCollection.IP, "4", f.ParamsFastTrace.Dot, true)
-	if err != nil {
-		log.Fatal(err)
+func resolveTraceMethod(traceMode trace.Method) trace.Method {
+	switch traceMode {
+	case trace.TCPTrace:
+		return trace.TCPTrace
+	case trace.UDPTrace:
+		return trace.UDPTrace
+	default:
+		return trace.ICMPTrace
 	}
-	var conf = trace.Config{
-		OSType:           f.ParamsFastTrace.OSType,
-		ICMPMode:         f.ParamsFastTrace.ICMPMode,
-		BeginHop:         f.ParamsFastTrace.BeginHop,
-		DstIP:            ip,
-		DstPort:          f.ParamsFastTrace.DstPort,
-		MaxHops:          f.ParamsFastTrace.MaxHops,
-		NumMeasurements:  3,
-		MaxAttempts:      f.ParamsFastTrace.MaxAttempts,
-		ParallelRequests: 18,
-		RDNS:             f.ParamsFastTrace.RDNS,
-		AlwaysWaitRDNS:   f.ParamsFastTrace.AlwaysWaitRDNS,
-		PacketInterval:   100,
-		TTLInterval:      500,
-		IPGeoSource:      ipgeo.GetSource("LeoMoeAPI"),
-		Timeout:          f.ParamsFastTrace.Timeout,
-		SrcAddr:          f.ParamsFastTrace.SrcAddr,
-		PktSize:          f.ParamsFastTrace.PktSize,
-		Lang:             f.ParamsFastTrace.Lang,
-	}
-
-	if oe {
-		fp, err := os.OpenFile("/tmp/trace.log", os.O_CREATE|os.O_APPEND|os.O_RDWR, os.ModePerm)
-		if err != nil {
-			return
-		}
-		defer func(fp *os.File) {
-			err := fp.Close()
-			if err != nil {
-				log.Fatal(err)
-			}
-		}(fp)
-
-		log.SetOutput(fp)
-		log.SetFlags(0)
-		log.Printf("『%s %s 』\n", location, ispCollection.ISPName)
-		log.Printf("traceroute to %s, %d hops max, %d byte packets, %s mode\n", ispCollection.IP, f.ParamsFastTrace.MaxHops, f.ParamsFastTrace.PktSize, strings.ToUpper(string(f.TracerouteMethod)))
-		conf.RealtimePrinter = tracelog.RealtimePrinter
-	} else {
-		conf.RealtimePrinter = printer.RealtimePrinter
-	}
-
-	_, err = trace.Traceroute(f.TracerouteMethod, conf)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println()
 }
 
-func FastTest(traceMode trace.Method, outEnable bool, paramsFastTrace ParamsFastTrace) {
-	// tm means tcp mode
-	var c string
-	oe = outEnable
-
-	if paramsFastTrace.File != "" {
-		testFile(paramsFastTrace, traceMode)
-		return
+func resolveFastTraceSourceAddr(srcDev string, wantV4 bool) string {
+	dev, devErr := net.InterfaceByName(srcDev)
+	if devErr != nil || dev == nil {
+		return ""
 	}
-
-	fmt.Println("Hi，欢迎使用 Fast Trace 功能，请注意 Fast Trace 功能只适合新手使用\n因为国内网络复杂，我们设置的测试目标有限，建议普通用户自测以获得更加精准的路由情况")
-	fmt.Println("请您选择要测试的 IP 类型\n1. IPv4\n2. IPv6")
-	fmt.Print("请选择选项：")
-	_, err := fmt.Scanln(&c)
+	addrs, err := dev.Addrs()
 	if err != nil {
-		c = "1"
+		return ""
 	}
-	if c == "2" {
-		if paramsFastTrace.SrcDev != "" {
-			dev, devErr := net.InterfaceByName(paramsFastTrace.SrcDev)
-			if devErr == nil && dev != nil {
-				if addrs, err := dev.Addrs(); err == nil {
-					for _, addr := range addrs {
-						ipNet, ok := addr.(*net.IPNet)
-						if !ok || ipNet.IP.To4() != nil {
-							continue
-						}
-						paramsFastTrace.SrcAddr = ipNet.IP.String()
-						parsed := net.ParseIP(paramsFastTrace.SrcAddr)
-						if parsed != nil && !(parsed.IsPrivate() || parsed.IsLoopback() ||
-							parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast()) {
-							break
-						}
-					}
-				}
-			}
+	var candidate string
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
 		}
-		FastTestv6(traceMode, outEnable, paramsFastTrace)
-		return
-	}
-	if paramsFastTrace.SrcDev != "" {
-		dev, devErr := net.InterfaceByName(paramsFastTrace.SrcDev)
-		if devErr == nil && dev != nil {
-			if addrs, err := dev.Addrs(); err == nil {
-				for _, addr := range addrs {
-					ipNet, ok := addr.(*net.IPNet)
-					if !ok || ipNet.IP.To4() == nil {
-						continue
-					}
-					paramsFastTrace.SrcAddr = ipNet.IP.String()
-					parsed := net.ParseIP(paramsFastTrace.SrcAddr)
-					if parsed != nil && !(parsed.IsPrivate() || parsed.IsLoopback() ||
-						parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast()) {
-						break
-					}
-				}
-			}
+		isV4 := ipNet.IP.To4() != nil
+		if isV4 != wantV4 {
+			continue
+		}
+		candidate = ipNet.IP.String()
+		parsed := net.ParseIP(candidate)
+		if parsed != nil && !(parsed.IsPrivate() || parsed.IsLoopback() ||
+			parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast()) {
+			return candidate
 		}
 	}
+	return candidate
+}
 
-	fmt.Println("您想测试哪些ISP的路由？\n1. 北京三网快速测试\n2. 上海三网快速测试\n3. 广州三网快速测试\n4. 全国电信\n5. 全国联通\n6. 全国移动\n7. 全国教育网\n8. 全国五网")
-	fmt.Print("请选择选项：")
-	_, err = fmt.Scanln(&c)
-	if err != nil {
-		c = "1"
+func withFastTraceSourceAddr(params ParamsFastTrace, wantV4 bool) ParamsFastTrace {
+	if params.SrcDev != "" {
+		if srcAddr := resolveFastTraceSourceAddr(params.SrcDev, wantV4); srcAddr != "" {
+			params.SrcAddr = srcAddr
+		}
 	}
+	return params
+}
 
-	ft := FastTracer{
-		ParamsFastTrace: paramsFastTrace,
+func promptFastTraceChoice(prompt, defaultChoice string) string {
+	fmt.Print(prompt)
+	var choice string
+	if _, err := fmt.Scanln(&choice); err != nil {
+		return defaultChoice
 	}
+	return choice
+}
 
-	// 建立 WebSocket 连接
-	w := wshandle.New()
+func initFastTraceWS(ctx context.Context) *wshandle.WsConn {
+	w := wshandle.NewWithContext(ctx)
 	w.Interrupt = make(chan os.Signal, 1)
 	signal.Notify(w.Interrupt, os.Interrupt)
-	defer func() {
-		w.Conn.Close()
-	}()
+	return w
+}
 
-	switch traceMode {
-	case trace.ICMPTrace:
-		ft.TracerouteMethod = trace.ICMPTrace
-	case trace.TCPTrace:
-		ft.TracerouteMethod = trace.TCPTrace
-	case trace.UDPTrace:
-		ft.TracerouteMethod = trace.UDPTrace
+func closeFastTraceWS(w *wshandle.WsConn) {
+	if w != nil {
+		w.Close()
 	}
+}
 
-	switch c {
-	case "1":
-		ft.testFastBJ()
+func newFastTracer(traceMode trace.Method, params ParamsFastTrace) FastTracer {
+	return FastTracer{
+		TracerouteMethod: resolveTraceMethod(traceMode),
+		ParamsFastTrace:  params,
+	}
+}
+
+func runFastTraceByChoice(ft FastTracer, choice string) {
+	switch choice {
 	case "2":
 		ft.testFastSH()
 	case "3":
@@ -220,30 +154,40 @@ func FastTest(traceMode trace.Method, outEnable bool, paramsFastTrace ParamsFast
 	}
 }
 
-func testFile(paramsFastTrace ParamsFastTrace, traceMode trace.Method) {
-	// 建立 WebSocket 连接
-	w := wshandle.New()
-	w.Interrupt = make(chan os.Signal, 1)
-	signal.Notify(w.Interrupt, os.Interrupt)
-	defer func() {
-		w.Conn.Close()
-	}()
-
-	var tracerouteMethod trace.Method
-	switch traceMode {
-	case trace.ICMPTrace:
-		tracerouteMethod = trace.ICMPTrace
-	case trace.TCPTrace:
-		tracerouteMethod = trace.TCPTrace
-	case trace.UDPTrace:
-		tracerouteMethod = trace.UDPTrace
+func parseIPListLine(ctx context.Context, line string) (IpListElement, bool) {
+	parts := strings.SplitN(line, " ", 2)
+	if len(parts) == 0 {
+		return IpListElement{}, false
 	}
 
-	filePath := paramsFastTrace.File
+	ip := parts[0]
+	desc := ip
+	if len(parts) == 2 {
+		desc = parts[1]
+	}
+
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		netIP, err := util.DomainLookUpWithContext(ctx, ip, "all", "", true)
+		if err != nil {
+			fmt.Printf("Ignoring invalid IP: %s\n", ip)
+			return IpListElement{}, false
+		}
+		ip = netIP.String()
+	}
+
+	return IpListElement{
+		Ip:       ip,
+		Desc:     desc,
+		Version4: strings.Contains(ip, "."),
+	}, true
+}
+
+func loadIPList(ctx context.Context, filePath string) []IpListElement {
 	file, err := os.Open(filePath)
 	if err != nil {
 		fmt.Println("Error opening file:", err)
-		return
+		return nil
 	}
 	defer func(file *os.File) {
 		err := file.Close()
@@ -251,130 +195,223 @@ func testFile(paramsFastTrace ParamsFastTrace, traceMode trace.Method) {
 			log.Fatal(err)
 		}
 	}(file)
-	var ipList []IpListElement
+
+	ipList := make([]IpListElement, 0)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		parts := strings.SplitN(line, " ", 2)
-
-		var ip, desc string
-		if len(parts) == 2 {
-			ip = parts[0]
-			desc = parts[1]
-		} else if len(parts) == 1 {
-			ip = parts[0]
-			desc = ip // Set the description to the IP if no description is provided
-		} else {
+		if ipElem, ok := parseIPListLine(ctx, line); ok {
+			ipList = append(ipList, ipElem)
+		} else if strings.TrimSpace(line) != "" {
 			fmt.Printf("Ignoring invalid line: %s\n", line)
-			continue
 		}
-
-		parsedIP := net.ParseIP(ip)
-		if parsedIP == nil {
-			netIp, err := util.DomainLookUp(ip, "all", "", true)
-			if err != nil {
-				fmt.Printf("Ignoring invalid IP: %s\n", ip)
-				continue
-			}
-			if len(parts) == 1 {
-				desc = ip
-			}
-			ip = netIp.String()
-		}
-
-		ipElem := IpListElement{
-			Ip:       ip,
-			Desc:     desc,
-			Version4: strings.Contains(ip, "."),
-		}
-
-		ipList = append(ipList, ipElem)
 	}
 
 	if err := scanner.Err(); err != nil {
 		fmt.Println("Error reading file:", err)
 	}
+	return ipList
+}
 
-	for _, ip := range ipList {
-		fmt.Fprintf(color.Output, "%s\n",
-			color.New(color.FgYellow, color.Bold).Sprint("『 "+ip.Desc+"』"),
-		)
-		if !util.EnableHidDstIP {
-			fmt.Printf("traceroute to %s, %d hops max, %d bytes payload, %s mode\n", ip.Ip, paramsFastTrace.MaxHops, paramsFastTrace.PktSize, strings.ToUpper(string(tracerouteMethod)))
-		} else {
-			fmt.Printf("traceroute to %s, %d hops max, %d bytes payload, %s mode\n", util.HideIPPart(ip.Ip), paramsFastTrace.MaxHops, paramsFastTrace.PktSize, strings.ToUpper(string(tracerouteMethod)))
-		}
-		var srcAddr string
-		if paramsFastTrace.SrcDev != "" {
-			dev, devErr := net.InterfaceByName(paramsFastTrace.SrcDev)
-			if devErr == nil && dev != nil {
-				if addrs, err := dev.Addrs(); err == nil {
-					wantV4 := ip.Version4
-					for _, addr := range addrs {
-						ipNet, ok := addr.(*net.IPNet)
-						if !ok {
-							continue
-						}
-						isV4 := ipNet.IP.To4() != nil
-						if isV4 != wantV4 {
-							continue
-						}
-						srcAddr = ipNet.IP.String()
-						parsed := net.ParseIP(srcAddr)
-						if parsed != nil && !(parsed.IsPrivate() || parsed.IsLoopback() ||
-							parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast()) {
-							break
-						}
-					}
-				}
-			}
-		}
+func printFileTraceHeader(ip IpListElement, params ParamsFastTrace, tracerouteMethod trace.Method) {
+	fmt.Fprintf(color.Output, "%s\n", color.New(color.FgYellow, color.Bold).Sprint("『 "+ip.Desc+"』"))
+	dst := ip.Ip
+	if util.EnableHidDstIP {
+		dst = util.HideIPPart(ip.Ip)
+	}
+	displayPacketSize := params.PktSize
+	if !params.PacketSizeSet {
+		displayPacketSize = trace.DefaultPacketSize(tracerouteMethod, net.ParseIP(ip.Ip))
+	}
+	fmt.Printf("traceroute to %s, %d hops max, %s, %s mode\n", dst, params.MaxHops, trace.FormatPacketSizeLabel(displayPacketSize), strings.ToUpper(string(tracerouteMethod)))
+}
 
-		var conf = trace.Config{
-			OSType:           paramsFastTrace.OSType,
-			ICMPMode:         paramsFastTrace.ICMPMode,
-			BeginHop:         paramsFastTrace.BeginHop,
-			DstIP:            net.ParseIP(ip.Ip),
-			DstPort:          paramsFastTrace.DstPort,
-			MaxHops:          paramsFastTrace.MaxHops,
-			NumMeasurements:  3,
-			ParallelRequests: 18,
-			RDNS:             paramsFastTrace.RDNS,
-			AlwaysWaitRDNS:   paramsFastTrace.AlwaysWaitRDNS,
-			PacketInterval:   100,
-			TTLInterval:      500,
-			IPGeoSource:      ipgeo.GetSource("LeoMoeAPI"),
-			Timeout:          paramsFastTrace.Timeout,
-			SrcAddr:          srcAddr,
-			PktSize:          paramsFastTrace.PktSize,
-			Lang:             paramsFastTrace.Lang,
-		}
+func buildFileTraceConfig(params ParamsFastTrace, tracerouteMethod trace.Method, ip IpListElement) trace.Config {
+	dstIP := net.ParseIP(ip.Ip)
+	packetSize := params.PktSize
+	if !params.PacketSizeSet {
+		packetSize = trace.DefaultPacketSize(tracerouteMethod, dstIP)
+	}
+	packetSizeSpec, err := trace.NormalizePacketSize(tracerouteMethod, dstIP, packetSize)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return trace.Config{
+		Context:          params.Context,
+		OSType:           params.OSType,
+		ICMPMode:         params.ICMPMode,
+		BeginHop:         params.BeginHop,
+		DstIP:            dstIP,
+		DstPort:          params.DstPort,
+		MaxHops:          params.MaxHops,
+		NumMeasurements:  3,
+		ParallelRequests: 18,
+		RDNS:             params.RDNS,
+		AlwaysWaitRDNS:   params.AlwaysWaitRDNS,
+		PacketInterval:   100,
+		TTLInterval:      500,
+		IPGeoSource:      ipgeo.GetSource("LeoMoeAPI"),
+		Timeout:          params.Timeout,
+		SrcAddr:          resolveFastTraceSourceAddr(params.SrcDev, ip.Version4),
+		PktSize:          packetSizeSpec.PayloadSize,
+		RandomPacketSize: packetSizeSpec.Random,
+		TOS:              params.TOS,
+		Lang:             params.Lang,
+	}
+}
 
-		if oe {
-			fp, err := os.OpenFile("/tmp/trace.log", os.O_CREATE|os.O_APPEND|os.O_RDWR, os.ModePerm)
-			if err != nil {
-				return
-			}
-			log.SetOutput(fp)
-			log.SetFlags(0)
-			log.Printf("『%s』\n", ip.Desc)
-			log.Printf("traceroute to %s, %d hops max, %d byte packets, %s mode\n", ip.Ip, paramsFastTrace.MaxHops, paramsFastTrace.PktSize, strings.ToUpper(string(tracerouteMethod)))
-			conf.RealtimePrinter = tracelog.RealtimePrinter
-			err = fp.Close()
-			if err != nil {
-				log.Fatal(err)
-			}
-		} else {
-			conf.RealtimePrinter = printer.RealtimePrinter
-		}
-
-		_, err := trace.Traceroute(tracerouteMethod, conf)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		fmt.Println()
+func configureFastTraceRealtimePrinter(conf *trace.Config, outputPath, header string) (func() error, error) {
+	if strings.TrimSpace(outputPath) == "" {
+		conf.RealtimePrinter = printer.RealtimePrinter
+		return nil, nil
 	}
 
+	fp, err := tracelog.OpenFile(outputPath)
+	if err != nil {
+		log.Printf("fast trace output open failed for %q: %v; falling back to stdout", outputPath, err)
+		conf.RealtimePrinter = printer.RealtimePrinter
+		return nil, nil
+	}
+	if err := tracelog.WriteHeader(fp, header); err != nil {
+		_ = fp.Close()
+		log.Printf("fast trace output header write failed for %q: %v; falling back to stdout", outputPath, err)
+		conf.RealtimePrinter = printer.RealtimePrinter
+		return nil, nil
+	}
+	conf.RealtimePrinter = tracelog.NewRealtimePrinter(io.MultiWriter(os.Stdout, fp))
+	return fp.Close, nil
+}
+
+func runFileTraceTarget(params ParamsFastTrace, tracerouteMethod trace.Method, ip IpListElement) {
+	printFileTraceHeader(ip, params, tracerouteMethod)
+
+	conf := buildFileTraceConfig(params, tracerouteMethod, ip)
+	displayPacketSize := params.PktSize
+	if !params.PacketSizeSet {
+		displayPacketSize = trace.DefaultPacketSize(tracerouteMethod, net.ParseIP(ip.Ip))
+	}
+	header := fmt.Sprintf("『%s』\ntraceroute to %s, %d hops max, %s, %s mode\n", ip.Desc, ip.Ip, params.MaxHops, trace.FormatPacketSizeLabel(displayPacketSize), strings.ToUpper(string(tracerouteMethod)))
+	cleanup, err := configureFastTraceRealtimePrinter(&conf, params.OutputPath, header)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	if cleanup != nil {
+		defer func() {
+			if closeErr := cleanup(); closeErr != nil {
+				log.Println(closeErr)
+			}
+		}()
+	}
+
+	if _, err := trace.Traceroute(tracerouteMethod, conf); err != nil {
+		log.Println(err)
+		return
+	}
+	fmt.Println()
+}
+
+func (f *FastTracer) tracert(location string, ispCollection ISPCollection) {
+	fmt.Fprintf(color.Output, "%s\n", color.New(color.FgYellow, color.Bold).Sprintf("『%s %s 』", location, ispCollection.ISPName))
+	displayPacketSize := f.ParamsFastTrace.PktSize
+	if !f.ParamsFastTrace.PacketSizeSet {
+		displayPacketSize = trace.DefaultPacketSize(f.TracerouteMethod, net.ParseIP(ispCollection.IP))
+	}
+	fmt.Printf("traceroute to %s, %d hops max, %s, %s mode\n", ispCollection.IP, f.ParamsFastTrace.MaxHops, trace.FormatPacketSizeLabel(displayPacketSize), strings.ToUpper(string(f.TracerouteMethod)))
+
+	// ip, err := util.DomainLookUp(ispCollection.IP, "4", "", true)
+	ip, err := util.DomainLookUpWithContext(f.ParamsFastTrace.Context, ispCollection.IP, "4", f.ParamsFastTrace.Dot, true)
+	if err != nil {
+		log.Fatal(err)
+	}
+	packetSize := f.ParamsFastTrace.PktSize
+	if !f.ParamsFastTrace.PacketSizeSet {
+		packetSize = trace.DefaultPacketSize(f.TracerouteMethod, ip)
+	}
+	packetSizeSpec, err := trace.NormalizePacketSize(f.TracerouteMethod, ip, packetSize)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var conf = trace.Config{
+		Context:          f.ParamsFastTrace.Context,
+		OSType:           f.ParamsFastTrace.OSType,
+		ICMPMode:         f.ParamsFastTrace.ICMPMode,
+		BeginHop:         f.ParamsFastTrace.BeginHop,
+		DstIP:            ip,
+		DstPort:          f.ParamsFastTrace.DstPort,
+		MaxHops:          f.ParamsFastTrace.MaxHops,
+		NumMeasurements:  3,
+		MaxAttempts:      f.ParamsFastTrace.MaxAttempts,
+		ParallelRequests: 18,
+		RDNS:             f.ParamsFastTrace.RDNS,
+		AlwaysWaitRDNS:   f.ParamsFastTrace.AlwaysWaitRDNS,
+		PacketInterval:   100,
+		TTLInterval:      500,
+		IPGeoSource:      ipgeo.GetSource("LeoMoeAPI"),
+		Timeout:          f.ParamsFastTrace.Timeout,
+		SrcAddr:          f.ParamsFastTrace.SrcAddr,
+		PktSize:          packetSizeSpec.PayloadSize,
+		RandomPacketSize: packetSizeSpec.Random,
+		TOS:              f.ParamsFastTrace.TOS,
+		Lang:             f.ParamsFastTrace.Lang,
+	}
+
+	header := fmt.Sprintf("『%s %s 』\ntraceroute to %s, %d hops max, %s, %s mode\n",
+		location, ispCollection.ISPName, ispCollection.IP, f.ParamsFastTrace.MaxHops, trace.FormatPacketSizeLabel(displayPacketSize), strings.ToUpper(string(f.TracerouteMethod)))
+	cleanup, err := configureFastTraceRealtimePrinter(&conf, f.ParamsFastTrace.OutputPath, header)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	if cleanup != nil {
+		defer func() {
+			if closeErr := cleanup(); closeErr != nil {
+				log.Println(closeErr)
+			}
+		}()
+	}
+
+	_, err = trace.Traceroute(f.TracerouteMethod, conf)
+
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	fmt.Println()
+}
+
+func FastTest(traceMode trace.Method, paramsFastTrace ParamsFastTrace) {
+	if paramsFastTrace.File != "" {
+		testFile(paramsFastTrace, traceMode)
+		return
+	}
+
+	fmt.Println("Hi，欢迎使用 Fast Trace 功能，请注意 Fast Trace 功能只适合新手使用\n因为国内网络复杂，我们设置的测试目标有限，建议普通用户自测以获得更加精准的路由情况")
+	fmt.Println("请您选择要测试的 IP 类型\n1. IPv4\n2. IPv6")
+	if promptFastTraceChoice("请选择选项：", "1") == "2" {
+		paramsFastTrace = withFastTraceSourceAddr(paramsFastTrace, false)
+		FastTestv6(traceMode, paramsFastTrace)
+		return
+	}
+	paramsFastTrace = withFastTraceSourceAddr(paramsFastTrace, true)
+
+	fmt.Println("您想测试哪些ISP的路由？\n1. 北京三网快速测试\n2. 上海三网快速测试\n3. 广州三网快速测试\n4. 全国电信\n5. 全国联通\n6. 全国移动\n7. 全国教育网\n8. 全国五网")
+	choice := promptFastTraceChoice("请选择选项：", "1")
+
+	w := initFastTraceWS(paramsFastTrace.Context)
+	defer closeFastTraceWS(w)
+
+	runFastTraceByChoice(newFastTracer(traceMode, paramsFastTrace), choice)
+}
+
+func testFile(paramsFastTrace ParamsFastTrace, traceMode trace.Method) {
+	w := initFastTraceWS(paramsFastTrace.Context)
+	defer closeFastTraceWS(w)
+
+	tracerouteMethod := resolveTraceMethod(traceMode)
+	for _, ip := range loadIPList(paramsFastTrace.Context, paramsFastTrace.File) {
+		runFileTraceTarget(paramsFastTrace, tracerouteMethod, ip)
+	}
 }
 
 func (f *FastTracer) testAll() {

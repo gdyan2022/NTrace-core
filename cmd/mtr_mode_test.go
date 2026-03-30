@@ -46,7 +46,7 @@ func TestCheckMTRConflicts_Table(t *testing.T) {
 func TestCheckMTRConflicts_JSON(t *testing.T) {
 	flags := map[string]bool{
 		"table": false, "raw": false, "classic": false,
-		"json": true, "output": false,
+		"json": true, "output": false, "outputDefault": false,
 		"routePath": false, "from": false, "fastTrace": false,
 		"file": false, "deploy": false,
 	}
@@ -56,6 +56,22 @@ func TestCheckMTRConflicts_JSON(t *testing.T) {
 	}
 	if conflict != "--json" {
 		t.Errorf("conflict = %q, want --json", conflict)
+	}
+}
+
+func TestCheckMTRConflicts_OutputDefault(t *testing.T) {
+	flags := map[string]bool{
+		"table": false, "raw": false, "classic": false,
+		"json": false, "output": false, "outputDefault": true,
+		"routePath": false, "from": false, "fastTrace": false,
+		"file": false, "deploy": false,
+	}
+	conflict, ok := checkMTRConflicts(flags)
+	if ok {
+		t.Fatal("expected conflict with --output-default")
+	}
+	if conflict != "--output-default" {
+		t.Errorf("conflict = %q, want --output-default", conflict)
 	}
 }
 
@@ -410,16 +426,17 @@ func TestNormalizeMTRReportConfig_WidePreservesGeoSettings(t *testing.T) {
 }
 
 func TestBuildRawAPIInfoLine_LeoMoeAPI(t *testing.T) {
-	old := util.FastIPMetaCache
+	oldCache := util.GetFastIPCache()
+	oldMeta := util.GetFastIPMetaCache()
 	t.Cleanup(func() {
-		util.FastIPMetaCache = old
+		util.SetFastIPCacheState(oldCache, oldMeta)
 	})
 
-	util.FastIPMetaCache = util.FastIPMeta{
+	util.SetFastIPCacheState("", util.FastIPMeta{
 		IP:       "2403:18c0:1001:462:dd:38ff:fe48:e0c5",
 		Latency:  "21.33",
 		NodeName: "DMIT.NRT",
-	}
+	})
 
 	got := buildRawAPIInfoLine("LeoMoeAPI")
 	want := "[NextTrace API] preferred API IP - [2403:18c0:1001:462:dd:38ff:fe48:e0c5] - 21.33ms - DMIT.NRT"

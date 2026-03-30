@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -31,6 +30,7 @@ func checkMTRConflicts(flags map[string]bool) (conflict string, ok bool) {
 		{"--classic", flags["classic"]},
 		{"--json", flags["json"]},
 		{"--output", flags["output"]},
+		{"--output-default", flags["outputDefault"]},
 		{"--route-path", flags["routePath"]},
 		{"--from", flags["from"]},
 		{"--fast-trace", flags["fastTrace"]},
@@ -54,16 +54,10 @@ func runMTRTUI(method trace.Method, conf trace.Config, hopIntervalMs int, maxPer
 	}
 
 	// Ctrl-C 优雅退出
-	ctx, cancel := context.WithCancel(context.Background())
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithCancel(sigCtx)
 	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-	go func() {
-		<-sigCh
-		cancel()
-	}()
 
 	// 初始化 TUI 控制器
 	ui := newMTRUI(cancel, initialDisplayMode)
@@ -114,7 +108,6 @@ func runMTRTUI(method trace.Method, conf trace.Config, hopIntervalMs int, maxPer
 	err := trace.RunMTR(ctx, method, roundConf, opts, onSnapshot)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		// 离开备用屏幕后再打印错误
-		ui.Leave()
 		fmt.Println(err)
 	}
 }
@@ -129,16 +122,8 @@ func runMTRReport(method trace.Method, conf trace.Config, hopIntervalMs int, max
 		maxPerHop = 10
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-	go func() {
-		<-sigCh
-		cancel()
-	}()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	startTime := time.Now()
 
@@ -192,16 +177,8 @@ func runMTRRaw(method trace.Method, conf trace.Config, hopIntervalMs int, maxPer
 		hopIntervalMs = 1000
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-	go func() {
-		<-sigCh
-		cancel()
-	}()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	opts := trace.MTRRawOptions{
 		HopInterval: time.Duration(hopIntervalMs) * time.Millisecond,
@@ -250,37 +227,14 @@ func writeMTRRawRuntimeError(w io.Writer, err error) {
 // resolveSrcIP 按优先级解析源 IP：--source > --dev 推导 > udp dial fallback。
 // 保证与目标 IP 族匹配，失败时返回 "unknown"。
 func resolveSrcIP(conf trace.Config) string {
-	// 1. --source 已指定
-	if conf.SrcAddr != "" {
-		return conf.SrcAddr
+	sourceDevice := conf.SourceDevice
+	if sourceDevice == "" {
+		sourceDevice = util.SrcDev
 	}
-
-	// 2. --dev 推导（已在 cmd.go 中赋值到 conf.SrcAddr，这里做兜底）
-	if util.SrcDev != "" {
-		if dev, err := net.InterfaceByName(util.SrcDev); err == nil {
-			if addrs, err2 := dev.Addrs(); err2 == nil {
-				for _, addr := range addrs {
-					if ipNet, ok := addr.(*net.IPNet); ok {
-						if (ipNet.IP.To4() == nil) == (conf.DstIP.To4() == nil) {
-							return ipNet.IP.String()
-						}
-					}
-				}
-			}
-		}
+	resolved, _, err := resolveConfiguredSrcAddr(conf.DstIP, conf.SrcAddr, sourceDevice)
+	if err == nil && strings.TrimSpace(resolved) != "" {
+		return resolved
 	}
-
-	// 3. udp dial fallback
-	if conf.DstIP != nil {
-		if c, err := net.Dial("udp", net.JoinHostPort(conf.DstIP.String(), "80")); err == nil {
-			if addr, ok := c.LocalAddr().(*net.UDPAddr); ok {
-				c.Close()
-				return addr.IP.String()
-			}
-			c.Close()
-		}
-	}
-
 	return "unknown"
 }
 
@@ -289,7 +243,7 @@ func buildAPIInfo(dataOrigin string) string {
 	if !strings.EqualFold(dataOrigin, "LeoMoeAPI") {
 		return ""
 	}
-	meta := util.FastIPMetaCache
+	meta := util.GetFastIPMetaCache()
 	if meta.IP == "" {
 		return ""
 	}
@@ -304,7 +258,7 @@ func buildRawAPIInfoLine(dataOrigin string) string {
 	if !strings.EqualFold(dataOrigin, "LeoMoeAPI") {
 		return ""
 	}
-	meta := util.FastIPMetaCache
+	meta := util.GetFastIPMetaCache()
 	if meta.IP == "" {
 		return ""
 	}

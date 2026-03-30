@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"runtime"
 	"strings"
@@ -24,6 +26,11 @@ import (
 
 var traceMu sync.Mutex
 var leoConnMu sync.Mutex
+var traceMapURLFn = tracemap.GetMapUrlWithContext
+var traceDomainLookupFn = util.DomainLookUpWithContext
+var withTraceMapScopeFn = func(setup *traceExecution, callback func() (string, error)) (string, error) {
+	return withTraceGeoDNSScope(setup, callback)
+}
 
 type traceExecution struct {
 	Req          traceRequest
@@ -44,7 +51,8 @@ type traceRequest struct {
 	Queries           int    `json:"queries"`
 	MaxHops           int    `json:"max_hops"`
 	TimeoutMs         int    `json:"timeout_ms"`
-	PacketSize        int    `json:"packet_size"`
+	PacketSize        *int   `json:"packet_size"`
+	TOS               *int   `json:"tos"`
 	ParallelRequests  int    `json:"parallel_requests"`
 	BeginHop          int    `json:"begin_hop"`
 	IPv4Only          bool   `json:"ipv4_only"`
@@ -101,76 +109,47 @@ type traceResponse struct {
 	DurationMs   int64         `json:"duration_ms"`
 }
 
-func prepareTrace(req traceRequest) (*traceExecution, int, error) {
-	exec := &traceExecution{
-		Req: req,
+type traceProtocolSelection struct {
+	protocol string
+	method   trace.Method
+	dstPort  int
+}
+
+func normalizeTraceRequest(req *traceRequest) (int, error) {
+	if req == nil {
+		return http.StatusBadRequest, errors.New("request is required")
 	}
 
-	exec.Req.Mode = strings.ToLower(strings.TrimSpace(exec.Req.Mode))
-
-	if exec.Req.Maptrace != nil {
-		exec.Req.DisableMaptrace = !*exec.Req.Maptrace
+	req.Mode = strings.ToLower(strings.TrimSpace(req.Mode))
+	if req.Maptrace != nil {
+		req.DisableMaptrace = !*req.Maptrace
 	}
-
-	target, err := normalizeTarget(exec.Req.Target)
-	if err != nil {
-		return nil, 400, err
+	if req.IPv4Only && req.IPv6Only {
+		return http.StatusBadRequest, errors.New("ipv4_only and ipv6_only cannot be true at the same time")
 	}
-	exec.Target = target
-
-	if exec.Req.IPv4Only && exec.Req.IPv6Only {
-		return nil, 400, errors.New("ipv4_only and ipv6_only cannot be true at the same time")
+	if err := validateSourceDevice(req.SourceDevice); err != nil {
+		return http.StatusBadRequest, err
 	}
-
-	if exec.Req.IntervalMs <= 0 {
-		exec.Req.IntervalMs = 2000
+	if req.IntervalMs <= 0 {
+		req.IntervalMs = 0
 	}
-	if exec.Req.MaxRounds < 0 {
-		exec.Req.MaxRounds = 0
+	if req.MaxRounds < 0 {
+		req.MaxRounds = 0
 	}
+	if req.TOS != nil && (*req.TOS < 0 || *req.TOS > 255) {
+		return http.StatusBadRequest, errors.New("tos must be within range 0-255")
+	}
+	return 0, nil
+}
 
-	protocol := strings.ToLower(strings.TrimSpace(exec.Req.Protocol))
+func resolveTraceProtocol(req traceRequest) (traceProtocolSelection, int, error) {
+	protocol := strings.ToLower(strings.TrimSpace(req.Protocol))
 	if protocol == "" {
 		protocol = "icmp"
 	}
 	if !contains(supportedProtocols, protocol) {
-		return nil, 400, fmt.Errorf("unsupported protocol %q", protocol)
+		return traceProtocolSelection{}, http.StatusBadRequest, fmt.Errorf("unsupported protocol %q", protocol)
 	}
-	exec.Protocol = protocol
-
-	dataProvider := normalizeDataProvider(exec.Req.DataProvider, exec.Req.DataProviderAlias)
-	if dataProvider == "" {
-		dataProvider = defaults["data_provider"].(string)
-	}
-
-	if strings.EqualFold(dataProvider, "DN42") {
-		exec.Req.DN42 = true
-	}
-
-	needsLeoWS := strings.EqualFold(dataProvider, "LEOMOEAPI")
-	if needsLeoWS && util.EnvDataProvider != "" {
-		dataProvider = util.EnvDataProvider
-		needsLeoWS = strings.EqualFold(dataProvider, "LEOMOEAPI")
-	}
-
-	if exec.Req.DN42 {
-		config.InitConfig()
-		exec.Req.DisableMaptrace = true
-		dataProvider = "DN42"
-	}
-
-	ipVersion := "all"
-	if exec.Req.IPv4Only {
-		ipVersion = "4"
-	} else if exec.Req.IPv6Only {
-		ipVersion = "6"
-	}
-
-	ip, err := util.DomainLookUp(target, ipVersion, strings.ToLower(exec.Req.DotServer), true)
-	if err != nil {
-		return nil, 500, err
-	}
-	exec.IP = ip
 
 	method := trace.ICMPTrace
 	switch protocol {
@@ -179,37 +158,118 @@ func prepareTrace(req traceRequest) (*traceExecution, int, error) {
 	case "tcp":
 		method = trace.TCPTrace
 	}
-	exec.Method = method
 
-	dstPort := exec.Req.Port
+	dstPort := req.Port
 	if dstPort == 0 {
 		switch method {
 		case trace.UDPTrace:
 			dstPort = 33494
 		case trace.TCPTrace:
 			dstPort = 80
-		default:
-			dstPort = 0
 		}
 	}
+
+	return traceProtocolSelection{
+		protocol: protocol,
+		method:   method,
+		dstPort:  dstPort,
+	}, 0, nil
+}
+
+func resolveTraceDataProvider(req *traceRequest) (string, bool) {
+	dataProvider := normalizeDataProvider(req.DataProvider, req.DataProviderAlias)
+	if dataProvider == "" {
+		dataProvider = defaults["data_provider"].(string)
+	}
+
+	if strings.EqualFold(dataProvider, "DN42") {
+		req.DN42 = true
+	}
+	if req.DN42 {
+		config.InitConfig()
+		req.DisableMaptrace = true
+		dataProvider = "DN42"
+	}
+
+	needsLeoWS := strings.EqualFold(dataProvider, "LEOMOEAPI")
+	if needsLeoWS && util.EnvDataProvider != "" {
+		dataProvider = util.EnvDataProvider
+		needsLeoWS = strings.EqualFold(dataProvider, "LEOMOEAPI")
+	}
+
+	return dataProvider, needsLeoWS
+}
+
+func resolveTraceIPVersion(req traceRequest) string {
+	switch {
+	case req.IPv4Only:
+		return "4"
+	case req.IPv6Only:
+		return "6"
+	default:
+		return "all"
+	}
+}
+
+func prepareTrace(ctx context.Context, req traceRequest) (*traceExecution, int, error) {
+	exec := &traceExecution{
+		Req: req,
+	}
+
+	if statusCode, err := normalizeTraceRequest(&exec.Req); err != nil {
+		return nil, statusCode, err
+	}
+
+	target, err := normalizeTarget(exec.Req.Target)
+	if err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+	exec.Target = target
+
+	protocol, statusCode, err := resolveTraceProtocol(exec.Req)
+	if err != nil {
+		return nil, statusCode, err
+	}
+	exec.Protocol = protocol.protocol
+	exec.Method = protocol.method
+
+	dataProvider, needsLeoWS := resolveTraceDataProvider(&exec.Req)
+	ip, err := traceDomainLookupFn(ctx, target, resolveTraceIPVersion(exec.Req), strings.ToLower(exec.Req.DotServer), true)
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	exec.IP = ip
 
 	exec.DataProvider = dataProvider
 	exec.PowProvider = strings.TrimSpace(exec.Req.PowProvider)
 	exec.NeedsLeoWS = needsLeoWS
-	exec.Config = buildTraceConfig(exec.Req, ip, dataProvider, dstPort)
+	exec.Config, err = buildTraceConfig(exec.Req, exec.Method, ip, dataProvider, protocol.dstPort)
+	if err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+	exec.Config.Context = ctx
 
 	return exec, 0, nil
 }
 
 func traceHandler(c *gin.Context) {
 	var req traceRequest
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxTraceRequestBodyBytes)
 	if err := c.ShouldBindJSON(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request payload too large"})
+			return
+		}
 		c.JSON(400, gin.H{"error": "invalid request payload", "details": err.Error()})
 		return
 	}
 
-	setup, statusCode, err := prepareTrace(req)
+	setup, statusCode, err := prepareTrace(c.Request.Context(), req)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		if statusCode == 0 {
 			statusCode = 500
 		}
@@ -224,63 +284,37 @@ func traceHandler(c *gin.Context) {
 	traceMu.Lock()
 	defer traceMu.Unlock()
 
-	prevSrcPort := util.SrcPort
-	prevDstIP := util.DstIP
-	prevSrcDev := util.SrcDev
-	prevDisableMPLS := util.DisableMPLS
-	prevPowProvider := util.PowProviderParam
-	defer func() {
-		util.SrcPort = prevSrcPort
-		util.DstIP = prevDstIP
-		util.SrcDev = prevSrcDev
-		util.DisableMPLS = prevDisableMPLS
-		util.PowProviderParam = prevPowProvider
-	}()
-
 	if setup.NeedsLeoWS {
-		if setup.PowProvider != "" {
-			log.Printf("[deploy] LeoMoeAPI using custom PoW provider=%s", sanitizeLogParam(setup.PowProvider))
-		} else {
-			log.Printf("[deploy] LeoMoeAPI using default PoW provider")
+		if _, err := withTraceSetupContext(setup, func() (struct{}, error) {
+			ensureLeoMoeConnection()
+			return struct{}{}, nil
+		}); err != nil {
+			log.Printf("[deploy] failed to initialize LeoMoeAPI connection target=%s error=%v", sanitizeLogParam(setup.Target), err)
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
 		}
-		util.PowProviderParam = setup.PowProvider
-		ensureLeoMoeConnection()
-	} else if setup.PowProvider != "" {
-		log.Printf("[deploy] overriding PoW provider=%s", sanitizeLogParam(setup.PowProvider))
-		util.PowProviderParam = setup.PowProvider
-	} else {
-		util.PowProviderParam = ""
 	}
-
-	util.SrcPort = setup.Req.SourcePort
-	util.DstIP = setup.IP.String()
-	if setup.Req.SourceDevice != "" {
-		util.SrcDev = setup.Req.SourceDevice
-	} else {
-		util.SrcDev = ""
-	}
-	util.DisableMPLS = setup.Req.DisableMPLS
 
 	configured := setup.Config
 	log.Printf("[deploy] starting trace target=%s resolved=%s method=%s lang=%s queries=%d maxHops=%d", sanitizeLogParam(setup.Target), setup.IP.String(), string(setup.Method), sanitizeLogParam(configured.Lang), configured.NumMeasurements, configured.MaxHops)
 
 	start := time.Now()
-	res, err := trace.Traceroute(setup.Method, configured)
+	res, err := withTraceSetupContext(setup, func() (*trace.Result, error) {
+		return traceTracerouteFn(setup.Method, configured)
+	})
 	duration := time.Since(start)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
 		log.Printf("[deploy] trace failed target=%s error=%v", sanitizeLogParam(setup.Target), err)
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 
-	traceMapURL := ""
-	if configured.Maptrace && shouldGenerateMap(setup.DataProvider) {
-		if payload, err := json.Marshal(res); err == nil {
-			if mapUrl, err := tracemap.GetMapUrl(string(payload)); err == nil {
-				traceMapURL = mapUrl
-				log.Printf("[deploy] trace map generated target=%s mapUrl=%s", sanitizeLogParam(setup.Target), traceMapURL)
-			}
-		}
+	traceMapURL := traceMapURLForResult(setup, res)
+	if traceMapURL != "" {
+		log.Printf("[deploy] trace map generated target=%s mapUrl=%s", sanitizeLogParam(setup.Target), traceMapURL)
 	}
 
 	response := traceResponse{
@@ -298,7 +332,7 @@ func traceHandler(c *gin.Context) {
 	c.JSON(200, response)
 }
 
-func buildTraceConfig(req traceRequest, ip net.IP, dataProvider string, port int) trace.Config {
+func buildTraceConfig(req traceRequest, method trace.Method, ip net.IP, dataProvider string, port int) (trace.Config, error) {
 	lang := strings.TrimSpace(req.Language)
 	if lang == "" {
 		lang = defaults["language"].(string)
@@ -309,9 +343,18 @@ func buildTraceConfig(req traceRequest, ip net.IP, dataProvider string, port int
 		timeout = defaults["timeout_ms"].(int)
 	}
 
-	packetSize := req.PacketSize
-	if packetSize <= 0 {
-		packetSize = defaults["packet_size"].(int)
+	packetSize := trace.DefaultPacketSize(method, ip)
+	if req.PacketSize != nil {
+		packetSize = *req.PacketSize
+	}
+	packetSizeSpec, err := trace.NormalizePacketSize(method, ip, packetSize)
+	if err != nil {
+		return trace.Config{}, err
+	}
+
+	tos := defaults["tos"].(int)
+	if req.TOS != nil {
+		tos = *req.TOS
 	}
 
 	if req.PacketInterval <= 0 {
@@ -356,6 +399,7 @@ func buildTraceConfig(req traceRequest, ip net.IP, dataProvider string, port int
 		ICMPMode:         req.ICMPMode,
 		SrcAddr:          req.SourceAddress,
 		SrcPort:          req.SourcePort,
+		SourceDevice:     strings.TrimSpace(req.SourceDevice),
 		BeginHop:         beginHop,
 		MaxHops:          maxHops,
 		NumMeasurements:  queries,
@@ -364,16 +408,79 @@ func buildTraceConfig(req traceRequest, ip net.IP, dataProvider string, port int
 		Timeout:          time.Duration(timeout) * time.Millisecond,
 		DstIP:            ip,
 		DstPort:          port,
-		IPGeoSource:      ipgeo.GetSource(dataProvider),
+		IPGeoSource:      ipgeo.GetSourceWithGeoDNS(dataProvider, req.DotServer),
 		RDNS:             !req.DisableRDNS,
 		AlwaysWaitRDNS:   alwaysWait,
 		PacketInterval:   req.PacketInterval,
 		TTLInterval:      req.TTLInterval,
 		Lang:             lang,
 		DN42:             req.DN42,
-		PktSize:          packetSize,
+		PktSize:          packetSizeSpec.PayloadSize,
+		RandomPacketSize: packetSizeSpec.Random,
+		TOS:              tos,
 		Maptrace:         !req.DisableMaptrace,
+		DisableMPLS:      req.DisableMPLS,
+	}, nil
+}
+
+func withTraceSetupContext[T any](setup *traceExecution, callback func() (T, error)) (T, error) {
+	if callback == nil {
+		var zero T
+		return zero, nil
 	}
+
+	prevPowProvider := util.PowProviderParam
+	util.PowProviderParam = ""
+	if setup != nil {
+		util.PowProviderParam = setup.PowProvider
+		if setup.NeedsLeoWS {
+			if setup.PowProvider != "" {
+				log.Printf("[deploy] LeoMoeAPI using custom PoW provider=%s", sanitizeLogParam(setup.PowProvider))
+			} else {
+				log.Printf("[deploy] LeoMoeAPI using default PoW provider")
+			}
+		} else if setup.PowProvider != "" {
+			log.Printf("[deploy] overriding PoW provider=%s", sanitizeLogParam(setup.PowProvider))
+		}
+	}
+	defer func() {
+		util.PowProviderParam = prevPowProvider
+	}()
+
+	return withTraceGeoDNSScope(setup, callback)
+}
+
+func withTraceGeoDNSScope[T any](setup *traceExecution, callback func() (T, error)) (T, error) {
+	if callback == nil {
+		var zero T
+		return zero, nil
+	}
+	dotServer := ""
+	if setup != nil {
+		dotServer = strings.TrimSpace(strings.ToLower(setup.Req.DotServer))
+	}
+	return util.WithGeoDNSResolver(dotServer, callback)
+}
+
+func traceMapURLForResult(setup *traceExecution, res *trace.Result) string {
+	if setup == nil || res == nil || !setup.Config.Maptrace || !shouldGenerateMap(setup.DataProvider) {
+		return ""
+	}
+	payload, err := json.Marshal(res)
+	if err != nil {
+		return ""
+	}
+	url, err := withTraceMapScopeFn(setup, func() (string, error) {
+		ctx := setup.Config.Context
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		return traceMapURLFn(ctx, string(payload))
+	})
+	if err != nil {
+		return ""
+	}
+	return url
 }
 
 func convertHops(res *trace.Result, lang string) []hopResponse {
@@ -423,66 +530,90 @@ func buildHopResponse(attempts []trace.Hop, idx int, lang string) hopResponse {
 	return resp
 }
 
+func parseTargetURLHost(target string) (string, string, error) {
+	fallbackSource := target
+	if !strings.Contains(target, "://") {
+		return "", fallbackSource, nil
+	}
+
+	u, err := url.Parse(target)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid target format: %w", err)
+	}
+	if u.Host != "" {
+		return u.Host, fallbackSource, nil
+	}
+	if u.Path != "" {
+		fallbackSource = strings.TrimPrefix(target, u.Scheme+"://")
+	}
+	return "", fallbackSource, nil
+}
+
+func extractTargetHost(target, fallbackSource string) (string, error) {
+	parseTarget := target
+	if strings.Contains(target, "/") {
+		if !strings.HasPrefix(parseTarget, "//") {
+			parseTarget = "//" + parseTarget
+		}
+		if u, err := url.Parse(parseTarget); err == nil && u.Host != "" {
+			return u.Host, nil
+		}
+	}
+
+	if !strings.Contains(fallbackSource, "/") {
+		return "", nil
+	}
+	idx := strings.Index(fallbackSource, "/")
+	if idx <= 0 {
+		return "", errors.New("invalid target format")
+	}
+	candidate := strings.TrimSpace(fallbackSource[:idx])
+	if candidate == "" {
+		return "", errors.New("invalid target format")
+	}
+	return candidate, nil
+}
+
+func stripTargetPort(target string) string {
+	// Try standard SplitHostPort first — handles host:port and [IPv6]:port.
+	if host, _, err := net.SplitHostPort(target); err == nil {
+		return host
+	}
+	// Bare [IPv6] without port.
+	if open := strings.Index(target, "["); open >= 0 {
+		close := strings.Index(target[open:], "]")
+		if close > 1 {
+			return target[open+1 : open+close]
+		}
+	}
+	// host:port with exactly one colon (plain IPv4 / hostname).
+	if strings.Count(target, ":") == 1 {
+		return target[:strings.Index(target, ":")]
+	}
+	return target
+}
+
 func normalizeTarget(input string) (string, error) {
 	target := strings.TrimSpace(input)
 	if target == "" {
 		return "", errors.New("target is required")
 	}
 
-	fallbackSource := target
-	host := ""
-
-	if strings.Contains(target, "://") {
-		u, err := url.Parse(target)
+	host, fallbackSource, err := parseTargetURLHost(target)
+	if err != nil {
+		return "", err
+	}
+	if host == "" {
+		host, err = extractTargetHost(target, fallbackSource)
 		if err != nil {
-			return "", fmt.Errorf("invalid target format: %w", err)
-		}
-		if u.Host != "" {
-			host = u.Host
-		} else if u.Path != "" {
-			fallbackSource = strings.TrimPrefix(target, u.Scheme+"://")
+			return "", err
 		}
 	}
-
-	if host == "" && strings.Contains(target, "/") {
-		parseTarget := target
-		if !strings.HasPrefix(parseTarget, "//") {
-			parseTarget = "//" + parseTarget
-		}
-		if u, err := url.Parse(parseTarget); err == nil && u.Host != "" {
-			host = u.Host
-		} else {
-			fallbackSource = target
-		}
-	}
-
-	if host == "" && strings.Contains(fallbackSource, "/") {
-		idx := strings.Index(fallbackSource, "/")
-		if idx <= 0 {
-			return "", errors.New("invalid target format")
-		}
-		candidate := strings.TrimSpace(fallbackSource[:idx])
-		if candidate == "" {
-			return "", errors.New("invalid target format")
-		}
-		host = candidate
-	}
-
 	if host != "" {
 		target = host
 	}
 
-	if strings.Contains(target, "]") && strings.Contains(target, "[") {
-		target = strings.Split(strings.Split(target, "]")[0], "[")[1]
-	} else if strings.Count(target, ":") == 1 {
-		if host, _, err := net.SplitHostPort(target); err == nil {
-			target = host
-		} else {
-			target = strings.Split(target, ":")[0]
-		}
-	}
-
-	return strings.TrimSpace(target), nil
+	return strings.TrimSpace(stripTargetPort(target)), nil
 }
 func normalizeDataProvider(provider string, alias string) string {
 	candidate := strings.TrimSpace(provider)
@@ -537,6 +668,25 @@ func shouldGenerateMap(provider string) bool {
 		}
 	}
 	return false
+}
+
+func validateSourceDevice(device string) error {
+	device = strings.TrimSpace(device)
+	if device == "" {
+		return nil
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("list network interfaces: %w", err)
+	}
+	for _, iface := range ifaces {
+		if iface.Name == device {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("unknown source_device %q", device)
 }
 
 func ensureLeoMoeConnection() {

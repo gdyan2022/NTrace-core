@@ -8,9 +8,8 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
-	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fatih/color"
@@ -23,10 +22,15 @@ type ResponseInfo struct {
 }
 
 var (
-	results = make(chan ResponseInfo)
-	timeout = 5 * time.Second
+	timeout       = 5 * time.Second
+	fastIPCacheMu sync.RWMutex
 )
 var FastIpCache = ""
+
+var (
+	fastIPLookupHostFn = LookupHostForGeo
+	fastIPCheckLatency = checkLatencyWithContext
+)
 
 // FastIPMeta 存储 FastIP 节点的结构化元数据。
 type FastIPMeta struct {
@@ -43,58 +47,93 @@ var FastIPMetaCache FastIPMeta
 var SuppressFastIPOutput bool
 
 func GetFastIP(domain string, port string, enableOutput bool) string {
+	ip, err := GetFastIPWithContext(context.Background(), domain, port, enableOutput)
+	if err != nil {
+		log.Printf("FastIP probe failed: %v", err)
+		return defaultFastIP()
+	}
+	return ip
+}
+
+func GetFastIPCache() string {
+	fastIPCacheMu.RLock()
+	defer fastIPCacheMu.RUnlock()
+	return FastIpCache
+}
+
+func GetFastIPMetaCache() FastIPMeta {
+	fastIPCacheMu.RLock()
+	defer fastIPCacheMu.RUnlock()
+	return FastIPMetaCache
+}
+
+func SetFastIPCacheState(ip string, meta FastIPMeta) {
+	fastIPCacheMu.Lock()
+	FastIpCache = ip
+	FastIPMetaCache = meta
+	fastIPCacheMu.Unlock()
+}
+
+func GetFastIPWithContext(ctx context.Context, domain string, port string, enableOutput bool) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	proxyUrl := GetProxy()
 	if proxyUrl != nil {
-		return "api.nxtrace.org"
+		return "api.nxtrace.org", nil
 	}
-	if FastIpCache != "" {
-		return FastIpCache
+	if cachedIP := GetFastIPCache(); cachedIP != "" {
+		return cachedIP, nil
 	}
 
 	var ips []net.IP
 	var err error
+	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	if domain == "api.nxtrace.org" {
-		ips, err = LookupHostForGeo(context.Background(), "api.nxtrace.org")
+		ips, err = fastIPLookupHostFn(lookupCtx, "api.nxtrace.org")
 	} else {
-		ips, err = LookupHostForGeo(context.Background(), domain)
+		ips, err = fastIPLookupHostFn(lookupCtx, domain)
 	}
 
 	if err != nil {
+		if lookupCtx.Err() != nil {
+			return "", lookupCtx.Err()
+		}
 		log.Println("DNS resolution failed, please check your system DNS Settings")
 	}
 
 	if len(ips) == 0 {
-		// 添加默认IP 45.88.195.154 2605:52c0:2:954:114:514:1919:810
-		ips = append(ips, net.ParseIP("45.88.195.154"))
-		ips = append(ips, net.ParseIP("2605:52c0:2:954:114:514:1919:810"))
+		ips = defaultFastIPCandidates()
 	}
 
+	results := make(chan ResponseInfo, len(ips))
 	for _, ip := range ips {
-		go checkLatency(domain, ip.String(), port)
+		go fastIPCheckLatency(ctx, domain, ip.String(), port, results)
 	}
 
 	var result ResponseInfo
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt)
 
 	select {
 	case result = <-results:
 		// 正常返回结果
 	case <-time.After(timeout):
 		log.Println("IP connection has been timeout(5s), please check your network")
-	case <-sigChan: // 响应中断信号
-		log.Println("Program interrupted by user")
-		os.Exit(0)
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
 
-	//if len(ips) > 0 {
-	// 填充结构化缓存
-	FastIPMetaCache = FastIPMeta{
+	//有些时候真的啥都不通，还是挑一个顶上吧
+	if result.IP == "" {
+		result.IP = defaultFastIP()
+	}
+
+	meta := FastIPMeta{
 		IP:       result.IP,
 		Latency:  result.Latency,
 		NodeName: strings.TrimSpace(result.Content),
 	}
+	SetFastIPCacheState(result.IP, meta)
 
 	if enableOutput && !SuppressFastIPOutput {
 		_, _ = fmt.Fprintf(color.Output, "%s preferred API IP - %s - %s - %s",
@@ -104,18 +143,22 @@ func GetFastIP(domain string, port string, enableOutput bool) string {
 			color.New(color.FgGreen, color.Bold).Sprintf("%s", result.Content),
 		)
 	}
-	//}
 
-	//有些时候真的啥都不通，还是挑一个顶上吧
-	if result.IP == "" {
-		result.IP = "45.88.195.154"
-	}
-
-	FastIpCache = result.IP
-	return result.IP
+	return result.IP, nil
 }
 
-func checkLatency(domain string, ip string, port string) {
+func defaultFastIPCandidates() []net.IP {
+	return []net.IP{
+		net.ParseIP("45.88.195.154"),
+		net.ParseIP("2605:52c0:2:954:114:514:1919:810"),
+	}
+}
+
+func defaultFastIP() string {
+	return "45.88.195.154"
+}
+
+func checkLatencyWithContext(ctx context.Context, domain string, ip string, port string, results chan<- ResponseInfo) {
 	start := time.Now()
 	if !strings.Contains(ip, ".") {
 		ip = "[" + ip + "]"
@@ -138,7 +181,7 @@ func checkLatency(domain string, ip string, port string) {
 	}
 
 	//此处虽然是 https://domain/ 但是实际上会使用指定的IP连接
-	req, err := http.NewRequest("GET", "https://"+ip+":"+port+"/", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+ip+":"+port+"/", nil)
 	if err != nil {
 		// !!! 此处不要给results返回任何值
 		//results <- ResponseInfo{IP: ip, Latency: "error", Content: ""}
@@ -168,5 +211,9 @@ func checkLatency(domain string, ip string, port string) {
 	bodyString := string(bodyBytes)
 
 	latency := fmt.Sprintf("%.2f", float64(time.Since(start))/float64(time.Millisecond))
-	results <- ResponseInfo{IP: ip, Latency: latency, Content: bodyString}
+	select {
+	case results <- ResponseInfo{IP: ip, Latency: latency, Content: bodyString}:
+	case <-ctx.Done():
+	default:
+	}
 }

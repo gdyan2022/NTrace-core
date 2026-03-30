@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -86,6 +87,98 @@ func (f *fakeWSConn) Close() error {
 
 func (f *fakeWSConn) NextReader() (messageType int, r io.Reader, err error) {
 	return 0, nil, io.EOF
+}
+
+type fakeWSInitConn struct {
+	deadlines    []time.Time
+	readLimit    int64
+	message      []byte
+	err          error
+	deadlineErrs []error
+}
+
+func (f *fakeWSInitConn) SetReadDeadline(t time.Time) error {
+	f.deadlines = append(f.deadlines, t)
+	if len(f.deadlineErrs) > 0 {
+		err := f.deadlineErrs[0]
+		f.deadlineErrs = f.deadlineErrs[1:]
+		return err
+	}
+	return nil
+}
+
+func (f *fakeWSInitConn) SetReadLimit(limit int64) {
+	f.readLimit = limit
+}
+
+func (f *fakeWSInitConn) ReadMessage() (messageType int, p []byte, err error) {
+	if f.err != nil {
+		return 0, nil, f.err
+	}
+	return websocket.TextMessage, f.message, nil
+}
+
+func TestReadWSInitMessage_ClearsDeadlineAfterSuccessfulRead(t *testing.T) {
+	conn := &fakeWSInitConn{message: []byte(`{"target":"example.com"}`)}
+
+	msg, err := readWSInitMessage(conn)
+	if err != nil {
+		t.Fatalf("readWSInitMessage returned error: %v", err)
+	}
+	if string(msg) != `{"target":"example.com"}` {
+		t.Fatalf("readWSInitMessage()=%q, want payload unchanged", string(msg))
+	}
+	if conn.readLimit != maxWSInitMessageBytes {
+		t.Fatalf("SetReadLimit=%d, want %d", conn.readLimit, maxWSInitMessageBytes)
+	}
+	if len(conn.deadlines) != 2 {
+		t.Fatalf("SetReadDeadline called %d times, want 2", len(conn.deadlines))
+	}
+	if conn.deadlines[0].IsZero() {
+		t.Fatal("initial read deadline should be set")
+	}
+	if !conn.deadlines[1].IsZero() {
+		t.Fatalf("final read deadline=%v, want zero time", conn.deadlines[1])
+	}
+}
+
+func TestReadWSInitMessage_ReturnsInitialDeadlineError(t *testing.T) {
+	conn := &fakeWSInitConn{
+		message:      []byte(`{"target":"example.com"}`),
+		deadlineErrs: []error{errors.New("set deadline failed")},
+	}
+
+	if _, err := readWSInitMessage(conn); err == nil || err.Error() != "set deadline failed" {
+		t.Fatalf("readWSInitMessage error = %v, want initial deadline error", err)
+	}
+}
+
+func TestReadWSInitMessage_ReturnsClearDeadlineError(t *testing.T) {
+	conn := &fakeWSInitConn{
+		message:      []byte(`{"target":"example.com"}`),
+		deadlineErrs: []error{nil, errors.New("clear deadline failed")},
+	}
+
+	if _, err := readWSInitMessage(conn); err == nil || err.Error() != "clear deadline failed" {
+		t.Fatalf("readWSInitMessage error = %v, want clear deadline error", err)
+	}
+}
+
+func TestNewWSSessionContextInheritsParentCancellation(t *testing.T) {
+	parent, cancelParent := context.WithCancel(context.Background())
+	ctx, cancel := newWSSessionContext(parent)
+	defer cancel()
+
+	cancelParent()
+
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("ctx.Err() = %v, want context.Canceled", ctx.Err())
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("session context did not inherit parent cancellation")
+	}
 }
 
 func TestWSTraceSessionSend_QueueOverflowReturnsErrSlowConsumer(t *testing.T) {
