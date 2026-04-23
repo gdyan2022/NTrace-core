@@ -55,6 +55,26 @@ Please note, there are exceptions to this synchronization. If a version of NTrac
 
 ### Automated Install
 
+- Debian / Ubuntu
+  - Recommended: install from the official `nexttrace-debs` APT repository
+    - Supports: `amd64`, `i386`, `arm64`, `armel`, `armhf`, `loong64`, `mipsel`, `mips64el`, `ppc64el`, `riscv64`, `s390x`
+    - Add the repository and install the default package:
+      ```shell
+      sudo install -d -m 0755 /etc/apt/keyrings
+      curl -fsSL -o /tmp/nexttrace-archive-keyring.gpg https://github.com/nxtrace/nexttrace-debs/releases/latest/download/nexttrace-archive-keyring.gpg
+      sudo install -m 0644 /tmp/nexttrace-archive-keyring.gpg /etc/apt/keyrings/nexttrace.gpg
+      rm -f /tmp/nexttrace-archive-keyring.gpg
+      printf '%s\n' 'Types: deb' 'URIs: https://github.com/nxtrace/nexttrace-debs/releases/latest/download/' 'Suites: ./' 'Signed-By: /etc/apt/keyrings/nexttrace.gpg' | sudo tee /etc/apt/sources.list.d/nexttrace.sources >/dev/null
+      sudo apt update
+      sudo apt install nexttrace
+      ```
+    - Optionally install additional flavors:
+      ```shell
+      sudo apt install nexttrace-tiny
+      sudo apt install ntr
+      ```
+    - Packages can be installed side by side. Commands: `nexttrace`, `nexttrace-tiny`, `ntr`
+
 - Linux / macOS / BSD
   - One-click installation script (Full, default)
 
@@ -74,23 +94,7 @@ Please note, there are exceptions to this synchronization. If a version of NTrac
     curl -sL https://nxtrace.org/nt | bash -s -- --flavor ntr
     ```
 
-  - Installed command names:
-    - Full: `nexttrace`
-    - Tiny: `nexttrace-tiny`
-    - NTR: `ntr`
-
-  - Install nxtrace from the APT repository
-    - Supports AMD64/ARM64 architectures
-      ```shell
-      curl -fsSL https://github.com/nxtrace/nexttrace-debs/releases/latest/download/nexttrace-archive-keyring.gpg | sudo tee /etc/apt/keyrings/nexttrace.gpg >/dev/null
-      echo "Types: deb
-      URIs: https://github.com/nxtrace/nexttrace-debs/releases/latest/download/
-      Suites: ./
-      Signed-By: /etc/apt/keyrings/nexttrace.gpg" | sudo tee /etc/apt/sources.list.d/nexttrace.sources >/dev/null
-      sudo apt update
-      sudo apt install nexttrace
-      ```
-    - APT repository maintained by wcbing and nxtrace
+  - Installed command names: Full `nexttrace`, Tiny `nexttrace-tiny`, NTR `ntr`
 
   - Arch Linux AUR installation command
     - Directly download bin package (only supports amd64)
@@ -154,7 +158,10 @@ Please note, there are exceptions to this synchronization. If a version of NTrac
       ```
     - Scoop-extra is maintained by soenggam
 
-Please note, the repositories for all of the above installation methods are maintained by open source enthusiasts. Availability and timely updates are not guaranteed. If you encounter problems, please contact the repository maintainer to solve them, or use the binary packages provided by the official build of this project.
+Please note:
+
+- The `nexttrace-debs` APT repository is maintained by nxtrace and wcbing.
+- Other package sources above are maintained by open-source enthusiasts. Availability and timely updates are not guaranteed. If you encounter problems, please contact the repository maintainer to solve them, or use the binary packages provided by the official build of this project.
 
 ### Manual Install
 
@@ -172,6 +179,8 @@ Starting from this release, NextTrace is published in **three flavors** under th
 | --------------------- | :----------------: | :--------------: | :----------: |
 | Normal traceroute     |         ✅         |        ✅        |      —       |
 | Standalone MTU (`--mtu`) |      ✅         |        ✅        |      —       |
+| CDN Speed (`--speed`) |         ✅         |        —         |      —       |
+| IP annotation (`--nali`) |       ✅       |        —         |      —       |
 | MTR TUI               |         ✅         |        —         | ✅ (default) |
 | MTR report (`-r`)     |         ✅         |        —         |      ✅      |
 | MTR wide (`-w`)       |         ✅         |        —         |      ✅      |
@@ -182,13 +191,13 @@ Starting from this release, NextTrace is published in **three flavors** under th
 | Default mode          |     traceroute     |    traceroute    |   MTR TUI    |
 | Binary name           |    `nexttrace`     | `nexttrace-tiny` |    `ntr`     |
 
-> **Note:** Package managers (Homebrew, AUR, Scoop, etc.) currently install the **Full** (`nexttrace`) version only.
+> **Note:** `APT (nexttrace-debs)` provides all three flavors: **Full** (`nexttrace`), **Tiny** (`nexttrace-tiny`), and **NTR** (`ntr`). Other package managers (Homebrew, AUR, Scoop, etc.) currently install the **Full** (`nexttrace`) version only.
 
 ### Feature Matrix
 
-- **`nexttrace`** — Full-featured build. Includes everything: traceroute, MTR, Globalping, and WebUI.
-- **`nexttrace-tiny`** — Lightweight build. Normal traceroute only, no MTR / Globalping / WebUI. Suitable for embedded or minimal environments.
-- **`ntr`** — MTR-focused build. Runs MTR TUI by default. No Globalping / WebUI; no normal traceroute mode and no standalone `--mtu` mode.
+- **`nexttrace`** — Full-featured build. Includes traceroute, standalone MTU, CDN speed test, IP annotation, MTR, Globalping, Fast Trace, and WebUI.
+- **`nexttrace-tiny`** — Lightweight build. Keeps normal traceroute, standalone MTU, and Fast Trace. No CDN speed test / IP annotation / MTR / Globalping / WebUI. Suitable for embedded or minimal environments.
+- **`ntr`** — MTR-focused build. Runs MTR TUI by default. No normal traceroute mode, standalone `--mtu`, CDN speed test, IP annotation, Globalping, Fast Trace, or WebUI.
 
 ### Manual Build
 
@@ -324,8 +333,7 @@ nexttrace --file /path/to/your/iplist.txt
 #### `NextTrace` already supports route tracing for specified Network Devices
 
 On macOS and Linux, `--dev` binds the requested source interface.
-On Windows, `--dev` only selects the source address and does not guarantee the actual egress interface.
-`TCP + --dev` remains explicitly unsupported on Windows and returns an error.
+On Windows, `--dev` resolves the source IP from the selected device and uses that source address for ICMP/TCP/UDP probes; it does not bind WinDivert or sockets to a real egress interface, so Windows routing may still choose a different path. The standalone `--mtu` mode follows the same source-address behavior and also uses the device name for local MTU lookup.
 
 ```bash
 # Use eth0 network interface
@@ -373,6 +381,51 @@ nexttrace --mtu --json 1.1.1.1
 - TTY output updates the current hop in place and adds color for hop state / PMTU highlights; redirected / piped output falls back to finalized line-by-line streaming without ANSI.
 - `--mtu --json` prints only the standalone MTU JSON document on stdout.
 - GeoIP, RDNS, `--data-provider`, `--language`, `--no-rdns`, `--always-rdns`, and `--dot-server` all apply to this mode.
+
+#### `NextTrace` also supports standalone CDN speed testing mode
+
+```bash
+# Apple CDN backend (default)
+nexttrace --speed
+
+# Cloudflare backend
+nexttrace --speed --speed-provider cloudflare
+
+# Dedicated speed help
+nexttrace --speed --help
+
+# Machine-readable output
+nexttrace --speed --json --non-interactive --no-metadata
+
+# Pin to a specific candidate IP, or bind a source address / device
+nexttrace --speed --endpoint 1.2.3.4
+nexttrace --speed --source 192.0.2.10
+nexttrace --speed --dev eth0
+```
+
+- `--speed` is available only in the full `nexttrace` flavor. `nexttrace-tiny` and `ntr` do not register it.
+- Main `nexttrace --help` only exposes the top-level `--speed` entry. Detailed speed flags live under `nexttrace --speed --help`.
+- Backends: `apple` (default) and `cloudflare`.
+- Reused common flags: `--json`, `--language`, `--no-color`, `--dot-server`, `--timeout`, `--source`, `--dev`.
+- Speed-specific flags: `--speed-provider`, `--max`, `--threads`, `--latency-count`, `--non-interactive`, `--endpoint`, `--no-metadata`.
+- Default terminal output includes candidate endpoints, the selected endpoint, client/server metadata, idle latency, download/upload single-thread and multi-thread rounds, loaded latency, total traffic, warnings, and degraded status.
+- `--json` prints exactly one JSON document to stdout.
+- Exit codes: `0` = success, `2` = degraded completion, `1` = failure, `130` = interrupted.
+
+#### `NextTrace` can annotate IP literals in text streams
+
+```bash
+# Annotate a single line
+nexttrace --nali 1.1.1.1
+
+# Annotate pipeline output
+dig example.com +short | nexttrace --nali --data-provider IPInfo --language en
+```
+
+- `--nali` is available only in the full `nexttrace` flavor. `nexttrace-tiny` and `ntr` do not register it.
+- It only annotates IPv4/IPv6 literals and reuses NextTrace GeoIP providers. CDN/CNAME matching, offline databases, update logic, and nali-specific paths are not bundled.
+- Reused common flags: `--data-provider`, `--language`, `--dot-server`, `--timeout`, `--dn42`, `-4`, and `-6`.
+- This text annotation mode is inspired by [zu1k/nali](https://github.com/zu1k/nali), which is licensed under the [MIT License](https://github.com/zu1k/nali/blob/master/LICENSE).
 
 #### `NextTrace` also supports some advanced functions, such as ttl control, concurrent probe packet count control, mode switching, etc.
 
@@ -674,8 +727,8 @@ NextTrace currently reads the following environment variables. For boolean switc
 
 ```shell
 Usage: nexttrace [-h|--help] [--init] [-4|--ipv4] [-6|--ipv6] [-T|--tcp]
-                 [-U|--udp] [-F|--fast-trace] [-p|--port <integer>]
-                 [--icmp-mode <integer>] [-q|--queries <integer>]
+                 [-U|--udp] [--speed] [--nali] [-F|--fast-trace]
+                 [-p|--port <integer>] [--icmp-mode <integer>] [-q|--queries <integer>]
                  [--max-attempts <integer>] [--parallel-requests <integer>]
                  [-m|--max-hops <integer>] [-d|--data-provider
                  (IP.SB|ip.sb|IPInfo|ipinfo|IPInsight|ipinsight|IPAPI.com|ip-api.com|IPInfoLocal|ipinfolocal|chunzhen|LeoMoeAPI|leomoeapi|ipdb.one|disable-geoip)]
@@ -698,6 +751,10 @@ Arguments:
   -h  --help                         Print help information
       --init                         Windows ONLY: Extract WinDivert runtime to
                                      executable directory
+      --speed                        Run CDN speed test mode. See `nexttrace
+                                     --speed --help` for details
+      --nali                         Annotate IP literals in text using
+                                     NextTrace GeoIP data
   -4  --ipv4                         Use IPv4 only
   -6  --ipv6                         Use IPv6 only
   -T  --tcp                          Use TCP SYN for tracerouting (default
@@ -760,8 +817,9 @@ Arguments:
                                      packets
   -D  --dev                          Use the specified network device for
                                      explicit source selection. On Windows,
-                                     this only chooses the source address and
-                                     does not guarantee the egress interface
+                                     this selects the device source address;
+                                     routing may still choose the egress
+                                     interface
       --listen                       Set listen address for web console (e.g.
                                      127.0.0.1:30080)
       --deploy                       Start the Gin powered web console
